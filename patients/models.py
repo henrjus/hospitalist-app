@@ -1,4 +1,7 @@
+from django.conf import settings
 from django.db import models
+from django.utils import timezone
+
 
 class Patient(models.Model):
     SEX_CHOICES = [
@@ -36,7 +39,6 @@ class Patient(models.Model):
     def __str__(self):
         return f"{self.name} (MRN {self.mrn})"
 
-from django.conf import settings
 
 class Signout(models.Model):
     patient = models.ForeignKey('Patient', on_delete=models.CASCADE, related_name='signouts')
@@ -65,7 +67,6 @@ class Signout(models.Model):
         who = f" by {self.created_by}" if self.created_by else ""
         return f"{self.patient.name} — {self.entry_date}{who}"
 
-from django.utils import timezone
 
 class Todo(models.Model):
     patient = models.ForeignKey('Patient', on_delete=models.CASCADE, related_name='todos')
@@ -103,6 +104,7 @@ class Todo(models.Model):
         if not self.completed_at:
             self.completed_at = timezone.now()
 
+
 class OvernightEvent(models.Model):
     patient = models.ForeignKey(Patient, on_delete=models.CASCADE, related_name="overnight_events")
     description = models.TextField()
@@ -113,3 +115,50 @@ class OvernightEvent(models.Model):
         return f"{self.patient.name} - {self.description[:30]}"
 
 
+# --- New for 5.6: Assignment model (Micro‑Step A) ---
+class Assignment(models.Model):
+    class Role(models.TextChoices):
+        PRIMARY = "PRIMARY", "Primary"
+        SECONDARY = "SECONDARY", "Secondary"
+
+    patient = models.ForeignKey(
+        'Patient',
+        on_delete=models.CASCADE,
+        related_name='assignments',
+    )
+    provider = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='patient_assignments',
+    )
+    role = models.CharField(
+        max_length=10,
+        choices=Role.choices,
+        default=Role.PRIMARY,
+    )
+    start_date = models.DateField()
+    end_date = models.DateField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-start_date', '-created_at']
+
+    def __str__(self) -> str:
+        return f"{self.patient} — {self.provider} ({self.role})"
+
+from django.contrib import admin
+from .models import Assignment
+
+@admin.register(Assignment)
+class AssignmentAdmin(admin.ModelAdmin):
+    list_display = ("patient", "provider", "role", "start_date", "end_date", "created_at")
+    list_filter = ("role", "provider", "start_date")
+    search_fields = (
+        "patient__mrn",
+        "patient__name",
+        "provider__username",
+        "provider__first_name",
+        "provider__last_name",
+    )
