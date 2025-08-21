@@ -14,6 +14,13 @@ SEX_CHOICES = (
 )
 
 
+# Patient lifecycle states
+class PatientStatus(models.TextChoices):
+    ACTIVE = "ACTIVE", "Active"
+    DISCHARGED = "DISCHARGED", "Discharged"
+    ARCHIVED = "ARCHIVED", "Archived"
+
+
 class Patient(models.Model):
     # Core identifiers & demographics
     mrn = models.CharField("MRN", max_length=32, unique=True)
@@ -24,6 +31,13 @@ class Patient(models.Model):
     # Clinical/census fields
     location = models.CharField(max_length=100, blank=True)
     diagnosis = models.CharField(max_length=255, blank=True)
+
+    # NEW: Admission-day narrative / key summary
+    patient_information = models.TextField(
+        "Patient Information",
+        blank=True,
+        help_text="Admission-day narrative or key summary for this patient."
+    )
 
     admission_date = models.DateField(null=True, blank=True)
     admission_time = models.TimeField(null=True, blank=True)
@@ -37,6 +51,16 @@ class Patient(models.Model):
         blank=False,                # enforce required in admin/forms
     )
 
+    # ↓↓↓ NEW LIFECYCLE FIELDS ↓↓↓
+    status = models.CharField(
+        max_length=16,
+        choices=PatientStatus.choices,
+        default=PatientStatus.ACTIVE,
+        db_index=True,
+    )
+    discharged_at = models.DateTimeField(null=True, blank=True)
+    archived_at = models.DateTimeField(null=True, blank=True)
+
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -48,10 +72,27 @@ class Patient(models.Model):
             models.Index(fields=["name"]),
             models.Index(fields=["admission_date", "admission_time"]),
             models.Index(fields=["attending"]),
+            models.Index(fields=["status"]),
         ]
 
     def __str__(self) -> str:
         return f"{self.mrn} — {self.name}"
+
+    # Convenience helpers for lifecycle transitions
+    def discharge(self, when: timezone.datetime | None = None):
+        when = when or timezone.now()
+        self.status = PatientStatus.DISCHARGED
+        self.discharged_at = when
+
+    def archive(self, when: timezone.datetime | None = None):
+        when = when or timezone.now()
+        self.status = PatientStatus.ARCHIVED
+        self.archived_at = when
+
+    @property
+    def is_read_only(self) -> bool:
+        # Non-active patients should be read-only in most UIs
+        return self.status != PatientStatus.ACTIVE
 
 
 class Signout(models.Model):

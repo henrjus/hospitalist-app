@@ -2,11 +2,14 @@ from datetime import date, datetime, time
 from django import forms
 from django.contrib import admin, messages
 from django.contrib.admin.sites import NotRegistered
+from django.contrib.admin import SimpleListFilter
 from django.contrib.admin.helpers import ActionForm
 from django.contrib.auth import get_user_model
+from django.conf import settings
 from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
 
-from .models import Patient, Signout, Todo, OvernightEvent, Assignment
+from .models import Patient, PatientStatus, Signout, Todo, OvernightEvent, Assignment
 
 User = get_user_model()
 
@@ -35,6 +38,15 @@ class SignoutInline(admin.StackedInline):
     fields = ("entry_date", "text", "created_by")
     readonly_fields = ("created_by",)
     show_change_link = True
+    ordering = ("entry_date",)   # Oldest first
+    # Default expanded (no 'collapse' class)
+
+    def formfield_for_dbfield(self, db_field, **kwargs):
+        formfield = super().formfield_for_dbfield(db_field, **kwargs)
+        if db_field.name == "text":
+            formfield.widget.attrs["rows"] = 4
+            formfield.widget.attrs["style"] = "width: 95%;"
+        return formfield
 
 class TodoInline(admin.TabularInline):
     model = Todo
@@ -67,7 +79,28 @@ class AssignmentInline(admin.TabularInline):
                     setattr(w, attr, False)
         return formset
 
-# ========== Patients Admin (with Attending FK + Bulk Action) ==========
+# ========== Custom Filters ==========
+
+class StatusListFilter(SimpleListFilter):
+    title = _("Status")
+    parameter_name = "status__exact"
+
+    def lookups(self, request, model_admin):
+        # Only actual statuses here; rely on Django's built-in "All" link at the top
+        return [
+            (PatientStatus.ACTIVE, _("Active")),
+            (PatientStatus.DISCHARGED, _("Discharged")),
+            (PatientStatus.ARCHIVED, _("Archived")),
+        ]
+
+    def queryset(self, request, queryset):
+        value = self.value()
+        if value in {PatientStatus.ACTIVE, PatientStatus.DISCHARGED, PatientStatus.ARCHIVED}:
+            return queryset.filter(status=value)
+        # value is None => built-in "All" selected => no status filter applied
+        return queryset
+
+# ========== Patients Admin (with Attending FK + Bulk Action + Lifecycle) ==========
 
 class SetAttendingActionForm(ActionForm):
     attending = forms.ModelChoiceField(
@@ -80,8 +113,19 @@ class SetAttendingActionForm(ActionForm):
         label="Set to TO BE ASSIGNED"
     )
 
+# --- PatientAdmin form to enlarge Patient Information textarea ---
+class PatientAdminForm(forms.ModelForm):
+    class Meta:
+        model = Patient
+        fields = "__all__"
+        widgets = {
+            "patient_information": forms.Textarea(attrs={"rows": 8}),
+        }
+
 @admin.register(Patient)
 class PatientAdmin(admin.ModelAdmin):
+    form = PatientAdminForm
+
     list_display = (
         "mrn",
         "name",
@@ -90,12 +134,16 @@ class PatientAdmin(admin.ModelAdmin):
         "location",
         "attending",       # FK to User (source of truth)
         "admit_display",
+        "status",          # lifecycle
+        "discharged_at",
+        "archived_at",
     )
     list_filter = (
         "sex",
         "location",
-        "attending",       # filter by attending FK
+        "attending",
         "admission_date",
+        StatusListFilter,  # lifecycle filter
     )
     search_fields = (
         "mrn",
@@ -109,12 +157,87 @@ class PatientAdmin(admin.ModelAdmin):
     date_hierarchy = "admission_date"
     ordering = ("-admission_date", "-admission_time")
     autocomplete_fields = ("attending",)
-    inlines = [AssignmentInline, TodoInline, OvernightEventInline, SignoutInline]
 
-    # Bulk Set/Clear Attending (clear -> set to placeholder)
+    # ✅ Signouts inline first
+    inlines = [SignoutInline, AssignmentInline, TodoInline, OvernightEventInline]
+
+    # ✅ Patient Information fieldset last
+    fieldsets = (
+        ("Identifiers", {
+            "fields": ("mrn", "name", "dob", "sex")
+        }),
+        ("Clinical / Census", {
+            "fields": ("location", "diagnosis", "admission_date", "admission_time", "attending")
+        }),
+        ("Lifecycle", {
+            "fields": ("status", "discharged_at", "archived_at")
+        }),
+        ("Timestamps", {
+            "classes": ("collapse",),
+            "fields": ("created_at", "updated_at"),
+        }),
+        ("Patient Information", {
+            "fields": ("patient_information",),
+        }),
+    )
+
+    # --- IMPORTANT: Non-editable fields must be readonly if in fieldsets ---
+    readonly_fields = ("created_at", "updated_at", "discharged_at", "archived_at")
+
+    # Default to Active only on first arrival (no referrer).
+    def changelist_view(self, request, extra_context=None):
+        if "status__exact" not in request.GET:
+            ref = request.META.get("HTTP_REFERER", "")
+            if not ref:  # first visit => default to Active
+                q = request.GET.copy()
+                q["status__exact"] = PatientStatus.ACTIVE
+                request.GET = q
+                request.META["QUERY_STRING"] = q.urlencode()
+        return super().changelist_view(request, extra_context=extra_context)
+
+    # ---------- Lifecycle Admin Actions ----------
+
     action_form = SetAttendingActionForm
-    actions = ["bulk_set_or_clear_attending"]
+    actions = [
+        "bulk_set_or_clear_attending",
+        "mark_active",
+        "discharge_now",
+        "archive_now",
+    ]
 
+    @admin.action(description="Mark Active (clear discharge/archive timestamps)")
+    def mark_active(self, request, queryset):
+        updated = queryset.update(
+            status=PatientStatus.ACTIVE,
+            discharged_at=None,
+            archived_at=None,
+        )
+        self.message_user(request, f"Marked {updated} patient(s) as ACTIVE.", level=messages.SUCCESS)
+
+    @admin.action(description="Discharge now (sets discharged_at=now)")
+    def discharge_now(self, request, queryset):
+        now = timezone.now()
+        updated = queryset.update(
+            status=PatientStatus.DISCHARGED,
+            discharged_at=now,
+        )
+        grace = getattr(settings, "PATIENT_DISCHARGE_GRACE_DAYS", 7)
+        self.message_user(
+            request,
+            f"Discharged {updated} patient(s). They will be eligible for auto-archive after {grace} day(s).",
+            level=messages.SUCCESS,
+        )
+
+    @admin.action(description="Archive now (sets archived_at=now)")
+    def archive_now(self, request, queryset):
+        now = timezone.now()
+        updated = queryset.update(
+            status=PatientStatus.ARCHIVED,
+            archived_at=now,
+        )
+        self.message_user(request, f"Archived {updated} patient(s).", level=messages.SUCCESS)
+
+    # Existing Attending bulk action
     @admin.action(description="Set/Clear Attending for selected patients")
     def bulk_set_or_clear_attending(self, request, queryset):
         attending_id = request.POST.get("attending")
@@ -160,6 +283,39 @@ class PatientAdmin(admin.ModelAdmin):
                 "Choose an Attending or check 'Set to TO BE ASSIGNED' before running the action.",
                 level=messages.WARNING,
             )
+
+    # ---------- Read-only behavior for non-Active patients ----------
+
+    def get_readonly_fields(self, request, obj=None):
+        """
+        Make patients read-only when status != ACTIVE.
+        Also always lock computed display columns.
+        """
+        ro = list(super().get_readonly_fields(request, obj))
+        # Always include computed display-only fields
+        ro += ["age_years", "los_days", "admit_display"]
+        if obj and obj.status != PatientStatus.ACTIVE:
+            # Mark all concrete model fields as read-only for non-active patients
+            ro += [f.attname for f in obj._meta.concrete_fields]
+        return tuple(sorted(set(ro)))
+
+    def has_delete_permission(self, request, obj=None):
+        """
+        Prevent deleting Discharged/Archived patients from Admin.
+        """
+        if obj and obj.status != PatientStatus.ACTIVE:
+            return False
+        return super().has_delete_permission(request, obj=obj)
+
+    def get_inline_instances(self, request, obj=None):
+        """
+        Hide inlines when the patient is not Active (to enforce read-only).
+        """
+        if obj and obj.status != PatientStatus.ACTIVE:
+            return []
+        return super().get_inline_instances(request, obj)
+
+    # ---------- Misc formatting ----------
 
     def get_changeform_initial_data(self, request):
         """Default Attending to the placeholder when adding a new patient."""
