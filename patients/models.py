@@ -1,164 +1,149 @@
+from __future__ import annotations
+
 from django.conf import settings
 from django.db import models
 from django.utils import timezone
 
 
+# Helpful constants
+SEX_CHOICES = (
+    ("M", "Male"),
+    ("F", "Female"),
+    ("O", "Other"),
+    ("U", "Unknown"),
+)
+
+
 class Patient(models.Model):
-    SEX_CHOICES = [
-        ('F', 'Female'),
-        ('M', 'Male'),
-        ('O', 'Other'),
-        ('U', 'Unknown'),
-    ]
-
-    # Core demographics
-    mrn = models.CharField(max_length=32, unique=True)
+    # Core identifiers & demographics
+    mrn = models.CharField("MRN", max_length=32, unique=True)
     name = models.CharField(max_length=200)
-    dob = models.DateField(verbose_name="Date of Birth", null=True, blank=True)
-    sex = models.CharField(max_length=1, choices=SEX_CHOICES, default='U')
+    dob = models.DateField("Date of Birth", null=True, blank=True)
+    sex = models.CharField(max_length=1, choices=SEX_CHOICES, default="U")
 
-    diagnosis = models.CharField(max_length=300, blank=True)
-    location = models.CharField(max_length=120, blank=True)  # e.g., "4W-12B"
-    attending_provider = models.CharField(max_length=120, blank=True)
+    # Clinical/census fields
+    location = models.CharField(max_length=100, blank=True)
+    diagnosis = models.CharField(max_length=255, blank=True)
 
     admission_date = models.DateField(null=True, blank=True)
     admission_time = models.TimeField(null=True, blank=True)
+
+    # REQUIRED: Attending physician (source of truth for census)
+    attending = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,   # don't allow deleting a user who still has patients
+        related_name="patients",
+        null=False,                 # enforce required in DB
+        blank=False,                # enforce required in admin/forms
+    )
 
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ["name"]
+        ordering = ("-admission_date", "-admission_time", "-created_at")
         indexes = [
             models.Index(fields=["mrn"]),
             models.Index(fields=["name"]),
-            models.Index(fields=["location"]),
+            models.Index(fields=["admission_date", "admission_time"]),
+            models.Index(fields=["attending"]),
         ]
 
-    def __str__(self):
-        return f"{self.name} (MRN {self.mrn})"
+    def __str__(self) -> str:
+        return f"{self.mrn} — {self.name}"
 
 
 class Signout(models.Model):
-    patient = models.ForeignKey('Patient', on_delete=models.CASCADE, related_name='signouts')
-    entry_date = models.DateField()  # the day this signout applies to
+    patient = models.ForeignKey(Patient, on_delete=models.CASCADE, related_name="signouts")
+    entry_date = models.DateField()
     text = models.TextField()
 
-    # metadata
+    # who created the signout entry
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
-        null=True, blank=True,
-        on_delete=models.SET_NULL,
-        related_name='created_signouts'
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="created_signouts",
     )
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        ordering = ['entry_date', 'created_at']
-        indexes = [
-            models.Index(fields=['entry_date']),
-        ]
-        unique_together = [('patient', 'entry_date', 'created_at')]
-        verbose_name = 'Signout entry'
-        verbose_name_plural = 'Signout entries'
+        ordering = ("-entry_date", "-created_at")
 
-    def __str__(self):
-        who = f" by {self.created_by}" if self.created_by else ""
-        return f"{self.patient.name} — {self.entry_date}{who}"
+    def __str__(self) -> str:
+        return f"Signout {self.patient.mrn} @ {self.entry_date}"
 
 
 class Todo(models.Model):
-    patient = models.ForeignKey('Patient', on_delete=models.CASCADE, related_name='todos')
-    text = models.CharField(max_length=300)
-    # status & timing
-    is_completed = models.BooleanField(default=False)
-    completed_at = models.DateTimeField(null=True, blank=True)
-    expires_at = models.DateTimeField(null=True, blank=True)
+    patient = models.ForeignKey(Patient, on_delete=models.CASCADE, related_name="todos")
+    text = models.TextField()
 
-    # metadata
+    is_completed = models.BooleanField(default=False)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
-        null=True, blank=True,
-        on_delete=models.SET_NULL,
-        related_name='created_todos'
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="created_todos",
     )
+
     created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ['is_completed', '-created_at']
-        indexes = [
-            models.Index(fields=['is_completed']),
-            models.Index(fields=['expires_at']),
-        ]
-        verbose_name = 'To‑do'
-        verbose_name_plural = 'To‑dos'
+        ordering = ("is_completed", "-created_at")
+        verbose_name = "To‑Do"
+        verbose_name_plural = "To‑Dos"
 
-    def __str__(self):
-        status = "✓" if self.is_completed else "•"
-        return f"{status} {self.patient.name}: {self.text[:40]}"
+    def __str__(self) -> str:
+        return f"Todo for {self.patient.mrn}"
 
-    def mark_completed(self):
-        self.is_completed = True
-        if not self.completed_at:
+    def save(self, *args, **kwargs):
+        # Auto-set completed_at when is_completed flips True and timestamp not set
+        if self.is_completed and self.completed_at is None:
             self.completed_at = timezone.now()
+        super().save(*args, **kwargs)
 
 
 class OvernightEvent(models.Model):
     patient = models.ForeignKey(Patient, on_delete=models.CASCADE, related_name="overnight_events")
     description = models.TextField()
-    created_at = models.DateTimeField(auto_now_add=True)
     resolved = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
 
-    def __str__(self):
-        return f"{self.patient.name} - {self.description[:30]}"
+    class Meta:
+        ordering = ("-created_at",)
+
+    def __str__(self) -> str:
+        return f"Overnight event for {self.patient.mrn}"
 
 
-# --- New for 5.6: Assignment model (Micro‑Step A) ---
 class Assignment(models.Model):
-    class Role(models.TextChoices):
-        PRIMARY = "PRIMARY", "Primary"
-        SECONDARY = "SECONDARY", "Secondary"
-
-    patient = models.ForeignKey(
-        'Patient',
-        on_delete=models.CASCADE,
-        related_name='assignments',
-    )
+    """
+    Optional feature (present but not used for census):
+    Could capture historical coverage/shifts per patient.
+    """
+    patient = models.ForeignKey(Patient, on_delete=models.CASCADE, related_name="assignments")
     provider = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name='patient_assignments',
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="patient_assignments"
     )
-    role = models.CharField(
-        max_length=10,
-        choices=Role.choices,
-        default=Role.PRIMARY,
-    )
+    role = models.CharField(max_length=50, blank=True)  # e.g., "Hospitalist", "Nocturnist", etc.
     start_date = models.DateField()
     end_date = models.DateField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ['-start_date', '-created_at']
+        ordering = ("-start_date", "-created_at")
+        indexes = [
+            models.Index(fields=["provider"]),
+            models.Index(fields=["start_date"]),
+        ]
 
     def __str__(self) -> str:
-        return f"{self.patient} — {self.provider} ({self.role})"
-
-from django.contrib import admin
-from .models import Assignment
-
-@admin.register(Assignment)
-class AssignmentAdmin(admin.ModelAdmin):
-    list_display = ("patient", "provider", "role", "start_date", "end_date", "created_at")
-    list_filter = ("role", "provider", "start_date")
-    search_fields = (
-        "patient__mrn",
-        "patient__name",
-        "provider__username",
-        "provider__first_name",
-        "provider__last_name",
-    )
+        return f"{self.patient.mrn} — {self.provider} ({self.role})"
