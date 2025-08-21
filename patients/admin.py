@@ -1,149 +1,255 @@
-from datetime import datetime, time
-from django.contrib import admin
+from datetime import date, datetime, time
+from django import forms
+from django.contrib import admin, messages
+from django.contrib.admin.sites import NotRegistered
+from django.contrib.admin.helpers import ActionForm
+from django.contrib.auth import get_user_model
 from django.utils import timezone
 
-from .models import Patient, Signout, Todo, OvernightEvent
+from .models import Patient, Signout, Todo, OvernightEvent, Assignment
 
+User = get_user_model()
 
-# ---------------------------
-# Patient Admin
-# ---------------------------
+# ========== Helpers ==========
+
+def _calc_age(dob: date | None) -> int | None:
+    if not dob:
+        return None
+    today = date.today()
+    return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+
+def _calc_los(admit_date: date | None, admit_time: time | None) -> int | None:
+    if not admit_date:
+        return None
+    if admit_time:
+        admit_dt = datetime.combine(admit_date, admit_time, tzinfo=timezone.get_current_timezone())
+    else:
+        admit_dt = datetime.combine(admit_date, datetime.min.time(), tzinfo=timezone.get_current_timezone())
+    return (timezone.now() - admit_dt).days
+
+# ========== Inlines ==========
+
+class SignoutInline(admin.StackedInline):
+    model = Signout
+    extra = 0
+    fields = ("entry_date", "text", "created_by")
+    readonly_fields = ("created_by",)
+    show_change_link = True
+
+class TodoInline(admin.TabularInline):
+    model = Todo
+    extra = 0
+    fields = ("text", "is_completed", "expires_at", "completed_at", "created_by")
+    readonly_fields = ("completed_at", "created_by")
+    show_change_link = True
+
+class OvernightEventInline(admin.TabularInline):
+    model = OvernightEvent
+    extra = 0
+    fields = ("description", "resolved", "created_at")
+    readonly_fields = ("created_at",)
+    show_change_link = True
+
+class AssignmentInline(admin.TabularInline):
+    model = Assignment
+    extra = 1
+    fields = ("provider", "role", "start_date", "end_date")
+    show_change_link = True
+
+    # Hide add/change/delete related buttons on the provider FK inside the inline
+    def get_formset(self, request, obj=None, **kwargs):
+        formset = super().get_formset(request, obj, **kwargs)
+        form = formset.form
+        if "provider" in form.base_fields:
+            w = form.base_fields["provider"].widget
+            for attr in ("can_add_related", "can_change_related", "can_delete_related"):
+                if hasattr(w, attr):
+                    setattr(w, attr, False)
+        return formset
+
+# ========== Patients Admin (with Attending FK + Bulk Action) ==========
+
+class SetAttendingActionForm(ActionForm):
+    attending = forms.ModelChoiceField(
+        queryset=User.objects.filter(is_active=True).order_by("last_name", "first_name", "username"),
+        required=False,
+        label="Assign attending"
+    )
+    clear_attending = forms.BooleanField(
+        required=False,
+        label="Set to TO BE ASSIGNED"
+    )
 
 @admin.register(Patient)
 class PatientAdmin(admin.ModelAdmin):
-    """
-    Uses your exact fields:
-      - attending_provider
-      - admission_date (DateField)
-      - admission_time (TimeField, optional)
-    """
     list_display = (
         "mrn",
         "name",
         "age_years",
         "los_days",
         "location",
-        "attending_provider",
-        "admit_col",
+        "attending",       # FK to User (source of truth)
+        "admit_display",
     )
-    list_display_links = ("mrn", "name")
-
-    # Safe, real fields:
-    # (added admission_date to filters per 5.5.F3)
-    list_filter = ("sex", "location", "attending_provider", "admission_date")
-
-    # Search MRN/Name/Diagnosis:
-    search_fields = ("mrn", "name", "diagnosis")
-
-    # Order by date then time (both real fields)
-    ordering = ("-admission_date", "-admission_time")
-
-    # Nice calendar drill-down on the date field
+    list_filter = (
+        "sex",
+        "location",
+        "attending",       # filter by attending FK
+        "admission_date",
+    )
+    search_fields = (
+        "mrn",
+        "name",
+        "diagnosis",
+        "attending__username",
+        "attending__first_name",
+        "attending__last_name",
+    )
+    list_select_related = ("attending",)
     date_hierarchy = "admission_date"
+    ordering = ("-admission_date", "-admission_time")
+    autocomplete_fields = ("attending",)
+    inlines = [AssignmentInline, TodoInline, OvernightEventInline, SignoutInline]
 
-    # If you have these (you do on Patient), surface them read-only in forms
-    readonly_fields = ("created_at", "updated_at")
+    # Bulk Set/Clear Attending (clear -> set to placeholder)
+    action_form = SetAttendingActionForm
+    actions = ["bulk_set_or_clear_attending"]
 
-    @admin.display(description="Age")
-    def age_years(self, obj: Patient):
-        if not obj.dob:
-            return ""
-        today = timezone.localdate()
-        years = today.year - obj.dob.year - (
-            (today.month, today.day) < (obj.dob.month, obj.dob.day)
-        )
-        return years
+    @admin.action(description="Set/Clear Attending for selected patients")
+    def bulk_set_or_clear_attending(self, request, queryset):
+        attending_id = request.POST.get("attending")
+        clear = request.POST.get("clear_attending")
 
-    def _admit_dt(self, obj: Patient):
-        """
-        Build a datetime from (admission_date + optional admission_time).
-        If time is missing, assume 12:00 for display purposes.
-        """
-        if not obj.admission_date:
-            return None
-        t = obj.admission_time or time(12, 0)
+        # Resolve placeholder user
         try:
-            # Attach current timezone for consistent display/LOS math
-            return timezone.make_aware(
-                datetime.combine(obj.admission_date, t),
-                timezone.get_current_timezone(),
+            tba_user = User.objects.get(username="to_be_assigned")
+        except User.DoesNotExist:
+            self.message_user(
+                request,
+                "Placeholder user 'to_be_assigned' was not found. Please run migrations again.",
+                level=messages.ERROR,
             )
-        except Exception:
-            # Fallback naive datetime if timezone not configured
-            return datetime.combine(obj.admission_date, t)
+            return
+
+        if clear:
+            updated = queryset.update(attending=tba_user)
+            self.message_user(
+                request,
+                f"Set Attending to TO BE ASSIGNED on {updated} patient(s).",
+                level=messages.SUCCESS,
+            )
+            return
+
+        if attending_id:
+            try:
+                user = User.objects.get(pk=attending_id)
+            except User.DoesNotExist:
+                self.message_user(request, "Selected Attending user not found.", level=messages.ERROR)
+                return
+
+            updated = queryset.update(attending=user)
+            display_name = user.get_full_name() or user.username
+            self.message_user(
+                request,
+                f"Set Attending to {display_name} on {updated} patient(s).",
+                level=messages.SUCCESS,
+            )
+        else:
+            self.message_user(
+                request,
+                "Choose an Attending or check 'Set to TO BE ASSIGNED' before running the action.",
+                level=messages.WARNING,
+            )
+
+    def get_changeform_initial_data(self, request):
+        """Default Attending to the placeholder when adding a new patient."""
+        initial = super().get_changeform_initial_data(request)
+        try:
+            tba_user = User.objects.get(username="to_be_assigned")
+            initial.setdefault("attending", tba_user.pk)
+        except User.DoesNotExist:
+            pass
+        return initial
+
+    def get_form(self, request, obj=None, **kwargs):
+        """
+        After Django wraps the widgets, disable the add/change/delete related
+        buttons for the 'attending' FK to avoid confusing user management UI.
+        """
+        form = super().get_form(request, obj, **kwargs)
+        if "attending" in form.base_fields:
+            w = form.base_fields["attending"].widget
+            for attr in ("can_add_related", "can_change_related", "can_delete_related"):
+                if hasattr(w, attr):
+                    setattr(w, attr, False)
+        return form
+
+    @admin.display(description="Age", ordering="dob")
+    def age_years(self, obj: Patient):
+        return _calc_age(obj.dob) or "—"
 
     @admin.display(description="LOS (d)")
     def los_days(self, obj: Patient):
+        return _calc_los(obj.admission_date, obj.admission_time) or "—"
+
+    @admin.display(description="Admit", ordering="admission_date")
+    def admit_display(self, obj: Patient):
         if not obj.admission_date:
-            return ""
-        # LOS as whole days based on dates → robust even if time missing
-        return (timezone.localdate() - obj.admission_date).days
+            return "—"
+        if obj.admission_time:
+            return f"{obj.admission_date} {obj.admission_time.strftime('%H:%M')}"
+        return str(obj.admission_date)
 
-    @admin.display(description="Admit")
-    def admit_col(self, obj: Patient):
-        dt = self._admit_dt(obj)
-        return dt.strftime("%Y-%m-%d %H:%M") if dt else ""
-
-
-# ---------------------------
-# Signout Admin
-# ---------------------------
+# ========== Other Models ==========
 
 @admin.register(Signout)
 class SignoutAdmin(admin.ModelAdmin):
-    list_display = ("patient", "entry_date", "created_by", "created_at", "text")
-    search_fields = ("patient__name", "patient__mrn", "text")
+    list_display = ("patient", "entry_date", "created_by", "created_at")
+    list_filter = ("entry_date", "created_by")
+    search_fields = ("patient__mrn", "patient__name", "text")
     date_hierarchy = "entry_date"
-    readonly_fields = tuple(f for f in ("created_at", "updated_at") if hasattr(Signout, f))
-
-    # Allow editing text directly in the list view
-    list_editable = ("text",)
-    list_display_links = ("patient",)
-
-
-# ---------------------------
-# Todo Admin
-# ---------------------------
+    ordering = ("-entry_date", "-created_at")
 
 @admin.register(Todo)
 class TodoAdmin(admin.ModelAdmin):
-    list_display = ("patient", "text", "is_completed", "expires_at", "created_at")
-    # Added expires_at filter per 5.5.F3
-    list_filter = ("is_completed", "expires_at")
-    search_fields = ("patient__name", "patient__mrn", "text")
-    date_hierarchy = "created_at"
-    readonly_fields = ("created_at", "updated_at")
+    list_display = ("patient", "text_short", "is_completed", "expires_at", "created_by", "created_at")
+    list_filter = ("is_completed", "expires_at", "created_by")
+    search_fields = ("patient__mrn", "patient__name", "text")
+    ordering = ("is_completed", "-created_at")
 
-    # Make completion editable right from the list page
-    list_editable = ("is_completed",)
-
-    # Keep the first column as the click-through link
-    list_display_links = ("patient",)
-
-    # Bulk actions
-    actions = ("mark_completed", "mark_not_completed")
-
-    @admin.action(description="Mark selected todos as completed")
-    def mark_completed(self, request, queryset):
-        queryset.update(is_completed=True, completed_at=timezone.now())
-
-    @admin.action(description="Mark selected todos as NOT completed")
-    def mark_not_completed(self, request, queryset):
-        queryset.update(is_completed=False, completed_at=None)
-
-
-# ---------------------------
-# OvernightEvent Admin
-# ---------------------------
+    @admin.display(description="Text")
+    def text_short(self, obj: Todo):
+        return obj.text if len(obj.text) <= 60 else f"{obj.text[:57]}..."
 
 @admin.register(OvernightEvent)
 class OvernightEventAdmin(admin.ModelAdmin):
-    list_display = ("patient", "description", "created_at", "resolved")
-    # Added created_at filter per 5.5.F3
+    list_display = ("patient", "desc_short", "resolved", "created_at")
     list_filter = ("resolved", "created_at")
-    search_fields = ("patient__name", "patient__mrn", "description")
+    search_fields = ("patient__mrn", "patient__name", "description")
     date_hierarchy = "created_at"
+    ordering = ("-created_at",)
 
-    # Allow editing description & resolved inline
-    list_editable = ("description", "resolved")
-    list_display_links = ("patient",)
+    @admin.display(description="Description")
+    def desc_short(self, obj: OvernightEvent):
+        return obj.description if len(obj.description) <= 60 else f"{obj.description[:57]}..."
+
+# ========== Assignments Admin (single registration) ==========
+
+class AssignmentAdmin(admin.ModelAdmin):
+    list_display = ("patient", "provider", "role", "start_date", "end_date", "created_at")
+    list_filter = ("role", "provider", "start_date")
+    search_fields = (
+        "patient__mrn",
+        "patient__name",
+        "provider__username",
+        "provider__first_name",
+        "provider__last_name",
+    )
+    ordering = ("-start_date", "-created_at")
+
+# Ensure only one registration of Assignment, even if this file reloads.
+try:
+    admin.site.unregister(Assignment)
+except NotRegistered:
+    pass
+admin.site.register(Assignment, AssignmentAdmin)
