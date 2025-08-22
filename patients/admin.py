@@ -15,6 +15,7 @@ from django.utils.translation import gettext_lazy as _
 from django.urls import path
 from django.shortcuts import redirect
 from django.utils.html import format_html
+from .models import Patient
 
 
 from .models import (
@@ -265,20 +266,24 @@ class PatientAdminForm(forms.ModelForm):
 class PatientAdmin(admin.ModelAdmin):
     form = PatientAdminForm
 
+    # Name → DOB → Age first, then your existing columns
     list_display = (
-        "mrn",
         "name",
-        "age_years",
+        "dob",
+        "age_display",       # computed; see method below
+        "mrn",
         "los_days",
         "location",
         "attending",
         "on_my_watchlist",   # column already present
-        "watch_toggle_link", # <-- NEW: per-row toggle link
+        "watch_toggle_link", # per-row toggle link
         "admit_display",
         "status",
         "discharged_at",
         "archived_at",
     )
+    list_display_links = ("name",)
+
     list_filter = (
         "sex",
         "location",
@@ -320,6 +325,12 @@ class PatientAdmin(admin.ModelAdmin):
             "fields": ("patient_information",),
         }),
     )
+
+    # --- NEW: Age display column (computed from model property) ---
+    @admin.display(description="Age", ordering="dob")
+    def age_display(self, obj: Patient):
+        return obj.age_years
+
 
     actions = ["add_to_my_watchlist_inline", "remove_from_my_watchlist_inline"]
 

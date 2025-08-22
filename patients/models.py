@@ -25,9 +25,9 @@ class PatientStatus(models.TextChoices):
 
 class Patient(models.Model):
     # Core identifiers & demographics
-    mrn = models.CharField("MRN", max_length=32, unique=True)
+    mrn = models.CharField(max_length=50, blank=True, null=True)
     name = models.CharField(max_length=200)
-    dob = models.DateField("Date of Birth", null=True, blank=True)
+    dob = models.DateField("Date of Birth")
     sex = models.CharField(max_length=1, choices=SEX_CHOICES, default="U")
 
     # Clinical/census fields
@@ -66,6 +66,16 @@ class Patient(models.Model):
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    # Computed age in full years from DOB (read-only; not stored in DB)
+    @property
+    def age_years(self):
+        if not self.dob:
+            return None
+        today = timezone.now().date()
+        return today.year - self.dob.year - (
+            (today.month, today.day) < (self.dob.month, self.dob.day)
+        )
 
     class Meta:
         ordering = ("-admission_date", "-admission_time", "-created_at")
