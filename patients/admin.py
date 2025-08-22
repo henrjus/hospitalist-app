@@ -1,4 +1,4 @@
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from django import forms
 from django.contrib import admin, messages
 from django.contrib.admin.sites import NotRegistered
@@ -8,8 +8,9 @@ from django.contrib.auth import get_user_model
 from django.conf import settings
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from django.db import transaction
 
-from .models import Patient, PatientStatus, Signout, Todo, OvernightEvent, Assignment
+from .models import Patient, PatientStatus, Signout, Todo, OvernightEvent, Assignment, Notification
 
 User = get_user_model()
 
@@ -30,6 +31,38 @@ def _calc_los(admit_date: date | None, admit_time: time | None) -> int | None:
         admit_dt = datetime.combine(admit_date, datetime.min.time(), tzinfo=timezone.get_current_timezone())
     return (timezone.now() - admit_dt).days
 
+# Quiet hours config (defaults: 16 → 7)
+QUIET_START_HOUR = getattr(settings, "NOTIFY_QUIET_START_HOUR", 16)  # 4 PM local
+QUIET_END_HOUR = getattr(settings, "NOTIFY_QUIET_END_HOUR", 7)       # 7 AM local
+
+def _is_quiet_hours(now: timezone.datetime) -> bool:
+    """Return True if local hour is within quiet window."""
+    local_now = timezone.localtime(now)
+    h = local_now.hour
+    start = QUIET_START_HOUR
+    end = QUIET_END_HOUR
+    if start == end:
+        return False
+    if start < end:
+        # same-day window (e.g., 9→17)
+        return start <= h < end
+    # overnight window (e.g., 16→7)
+    return h >= start or h < end
+
+def _next_visible_time(now: timezone.datetime) -> timezone.datetime:
+    """
+    If within quiet hours, return the next window end today/tomorrow at end hour.
+    Otherwise return 'now'.
+    """
+    if not _is_quiet_hours(now):
+        return now
+    local_now = timezone.localtime(now)
+    tz = timezone.get_current_timezone()
+    # If before END, deliver today at END; else tomorrow at END
+    deliver_date = local_now.date() if local_now.hour < QUIET_END_HOUR else (local_now.date() + timedelta(days=1))
+    naive = datetime.combine(deliver_date, time(hour=QUIET_END_HOUR, minute=0))
+    return timezone.make_aware(naive, tz)
+
 # ========== Inlines ==========
 
 class SignoutInline(admin.StackedInline):
@@ -39,7 +72,6 @@ class SignoutInline(admin.StackedInline):
     readonly_fields = ("created_by",)
     show_change_link = True
     ordering = ("entry_date",)   # Oldest first
-    # Default expanded (no 'collapse' class)
 
     def formfield_for_dbfield(self, db_field, **kwargs):
         formfield = super().formfield_for_dbfield(db_field, **kwargs)
@@ -86,7 +118,6 @@ class StatusListFilter(SimpleListFilter):
     parameter_name = "status__exact"
 
     def lookups(self, request, model_admin):
-        # Only actual statuses here; rely on Django's built-in "All" link at the top
         return [
             (PatientStatus.ACTIVE, _("Active")),
             (PatientStatus.DISCHARGED, _("Discharged")),
@@ -97,7 +128,6 @@ class StatusListFilter(SimpleListFilter):
         value = self.value()
         if value in {PatientStatus.ACTIVE, PatientStatus.DISCHARGED, PatientStatus.ARCHIVED}:
             return queryset.filter(status=value)
-        # value is None => built-in "All" selected => no status filter applied
         return queryset
 
 # ========== Patients Admin (with Attending FK + Bulk Action + Lifecycle) ==========
@@ -113,7 +143,6 @@ class SetAttendingActionForm(ActionForm):
         label="Set to TO BE ASSIGNED"
     )
 
-# --- PatientAdmin form to enlarge Patient Information textarea ---
 class PatientAdminForm(forms.ModelForm):
     class Meta:
         model = Patient
@@ -132,9 +161,9 @@ class PatientAdmin(admin.ModelAdmin):
         "age_years",
         "los_days",
         "location",
-        "attending",       # FK to User (source of truth)
+        "attending",
         "admit_display",
-        "status",          # lifecycle
+        "status",
         "discharged_at",
         "archived_at",
     )
@@ -143,7 +172,7 @@ class PatientAdmin(admin.ModelAdmin):
         "location",
         "attending",
         "admission_date",
-        StatusListFilter,  # lifecycle filter
+        StatusListFilter,
     )
     search_fields = (
         "mrn",
@@ -158,10 +187,8 @@ class PatientAdmin(admin.ModelAdmin):
     ordering = ("-admission_date", "-admission_time")
     autocomplete_fields = ("attending",)
 
-    # ✅ Signouts inline first
     inlines = [SignoutInline, AssignmentInline, TodoInline, OvernightEventInline]
 
-    # ✅ Patient Information fieldset last
     fieldsets = (
         ("Identifiers", {
             "fields": ("mrn", "name", "dob", "sex")
@@ -181,22 +208,51 @@ class PatientAdmin(admin.ModelAdmin):
         }),
     )
 
-    # --- IMPORTANT: Non-editable fields must be readonly if in fieldsets ---
     readonly_fields = ("created_at", "updated_at", "discharged_at", "archived_at")
 
-    # Default to Active only on first arrival (no referrer).
     def changelist_view(self, request, extra_context=None):
         if "status__exact" not in request.GET:
             ref = request.META.get("HTTP_REFERER", "")
-            if not ref:  # first visit => default to Active
+            if not ref:
                 q = request.GET.copy()
                 q["status__exact"] = PatientStatus.ACTIVE
                 request.GET = q
                 request.META["QUERY_STRING"] = q.urlencode()
         return super().changelist_view(request, extra_context=extra_context)
 
-    # ---------- Lifecycle Admin Actions ----------
+    # ---------- Notification helpers ----------
+    def _notify_assignment(self, patient: Patient, new_attending: User):
+        """
+        Create/queue a notification to the assigned hospitalist.
+        Dedupes: removes any *pending* (future-visible) assignment notifications
+        for this patient so only the final pre-7AM assignment fires.
+        """
+        now = timezone.now()
+        visible_at = _next_visible_time(now)
 
+        # 1) Cancel any pending overnight assignment notifications for this patient
+        Notification.objects.filter(
+            kind=Notification.Kind.ASSIGNMENT,
+            patient=patient,
+            visible_at__gt=now,  # future-visible (e.g., next 7 AM)
+        ).delete()
+
+        # 2) Push the latest assignment notification (respecting quiet hours)
+        msg = (
+            f"New patient assigned to you: {patient.mrn} — {patient.name}."
+            f" Location: {patient.location or '—'}."
+            f" Dx: {patient.diagnosis or '—'}."
+        )
+        Notification.push(
+            recipient=new_attending,
+            message=msg,
+            level=Notification.Level.INFO,
+            patient=patient,
+            visible_at=visible_at,
+            kind=Notification.Kind.ASSIGNMENT,
+        )
+
+    # ---------- Lifecycle Admin Actions ----------
     action_form = SetAttendingActionForm
     actions = [
         "bulk_set_or_clear_attending",
@@ -237,7 +293,6 @@ class PatientAdmin(admin.ModelAdmin):
         )
         self.message_user(request, f"Archived {updated} patient(s).", level=messages.SUCCESS)
 
-    # Existing Attending bulk action
     @admin.action(description="Set/Clear Attending for selected patients")
     def bulk_set_or_clear_attending(self, request, queryset):
         attending_id = request.POST.get("attending")
@@ -254,8 +309,15 @@ class PatientAdmin(admin.ModelAdmin):
             )
             return
 
+        # CLEAR: set to placeholder (no notification sent)
         if clear:
-            updated = queryset.update(attending=tba_user)
+            with transaction.atomic():
+                updated = 0
+                for p in queryset.select_for_update():
+                    if p.attending_id != tba_user.id:
+                        p.attending = tba_user
+                        p.save(update_fields=["attending"])
+                        updated += 1
             self.message_user(
                 request,
                 f"Set Attending to TO BE ASSIGNED on {updated} patient(s).",
@@ -263,6 +325,7 @@ class PatientAdmin(admin.ModelAdmin):
             )
             return
 
+        # ASSIGN: set to selected user and notify them
         if attending_id:
             try:
                 user = User.objects.get(pk=attending_id)
@@ -270,7 +333,17 @@ class PatientAdmin(admin.ModelAdmin):
                 self.message_user(request, "Selected Attending user not found.", level=messages.ERROR)
                 return
 
-            updated = queryset.update(attending=user)
+            with transaction.atomic():
+                updated = 0
+                for p in queryset.select_for_update():
+                    if p.attending_id != user.id:
+                        p.attending = user
+                        p.save(update_fields=["attending"])
+                        updated += 1
+                        # Queue notification for the new attending
+                        if user.username != "to_be_assigned":
+                            self._notify_assignment(p, user)
+
             display_name = user.get_full_name() or user.username
             self.message_user(
                 request,
@@ -285,40 +358,25 @@ class PatientAdmin(admin.ModelAdmin):
             )
 
     # ---------- Read-only behavior for non-Active patients ----------
-
     def get_readonly_fields(self, request, obj=None):
-        """
-        Make patients read-only when status != ACTIVE.
-        Also always lock computed display columns.
-        """
         ro = list(super().get_readonly_fields(request, obj))
-        # Always include computed display-only fields
         ro += ["age_years", "los_days", "admit_display"]
         if obj and obj.status != PatientStatus.ACTIVE:
-            # Mark all concrete model fields as read-only for non-active patients
             ro += [f.attname for f in obj._meta.concrete_fields]
         return tuple(sorted(set(ro)))
 
     def has_delete_permission(self, request, obj=None):
-        """
-        Prevent deleting Discharged/Archived patients from Admin.
-        """
         if obj and obj.status != PatientStatus.ACTIVE:
             return False
         return super().has_delete_permission(request, obj=obj)
 
     def get_inline_instances(self, request, obj=None):
-        """
-        Hide inlines when the patient is not Active (to enforce read-only).
-        """
         if obj and obj.status != PatientStatus.ACTIVE:
             return []
         return super().get_inline_instances(request, obj)
 
     # ---------- Misc formatting ----------
-
     def get_changeform_initial_data(self, request):
-        """Default Attending to the placeholder when adding a new patient."""
         initial = super().get_changeform_initial_data(request)
         try:
             tba_user = User.objects.get(username="to_be_assigned")
@@ -328,10 +386,6 @@ class PatientAdmin(admin.ModelAdmin):
         return initial
 
     def get_form(self, request, obj=None, **kwargs):
-        """
-        After Django wraps the widgets, disable the add/change/delete related
-        buttons for the 'attending' FK to avoid confusing user management UI.
-        """
         form = super().get_form(request, obj, **kwargs)
         if "attending" in form.base_fields:
             w = form.base_fields["attending"].widget
@@ -339,6 +393,23 @@ class PatientAdmin(admin.ModelAdmin):
                 if hasattr(w, attr):
                     setattr(w, attr, False)
         return form
+
+    def save_model(self, request, obj, form, change):
+        prev_attending = None
+        if change and obj.pk and "attending" in getattr(form, "changed_data", []):
+            try:
+                prev = Patient.objects.get(pk=obj.pk)
+                prev_attending = prev.attending
+            except Patient.DoesNotExist:
+                prev_attending = None
+
+        super().save_model(request, obj, form, change)
+
+        if change and "attending" in getattr(form, "changed_data", []):
+            new_attending = obj.attending
+            if new_attending and (not prev_attending or prev_attending.id != new_attending.id):
+                if getattr(new_attending, "username", None) != "to_be_assigned":
+                    self._notify_assignment(obj, new_attending)
 
     @admin.display(description="Age", ordering="dob")
     def age_years(self, obj: Patient):
@@ -389,6 +460,38 @@ class OvernightEventAdmin(admin.ModelAdmin):
     def desc_short(self, obj: OvernightEvent):
         return obj.description if len(obj.description) <= 60 else f"{obj.description[:57]}..."
 
+# ========== Notifications Admin ==========
+
+@admin.register(Notification)
+class NotificationAdmin(admin.ModelAdmin):
+    list_display = ("visible_at", "recipient", "level", "short_message", "is_read_flag", "created_at")
+    list_display_links = ("visible_at", "short_message")
+    list_filter = ("level", ("visible_at", admin.DateFieldListFilter), "recipient")
+    search_fields = ("message", "recipient__username", "recipient__first_name", "recipient__last_name")
+    actions = ["mark_as_read", "mark_as_unread"]
+    date_hierarchy = "visible_at"
+    ordering = ("-visible_at", "-created_at")
+
+    def short_message(self, obj):
+        msg = obj.message or ""
+        return (msg[:80] + "…") if len(msg) > 80 else msg
+    short_message.short_description = "Message"
+
+    def is_read_flag(self, obj):
+        return obj.read_at is not None
+    is_read_flag.boolean = True
+    is_read_flag.short_description = "Read?"
+
+    @admin.action(description="Mark selected notifications as READ")
+    def mark_as_read(self, request, queryset):
+        updated = queryset.filter(read_at__isnull=True).update(read_at=timezone.now())
+        self.message_user(request, f"Marked {updated} notification(s) as read.")
+
+    @admin.action(description="Mark selected notifications as UNREAD")
+    def mark_as_unread(self, request, queryset):
+        updated = queryset.update(read_at=None)
+        self.message_user(request, f"Marked {updated} notification(s) as unread.")
+
 # ========== Assignments Admin (single registration) ==========
 
 class AssignmentAdmin(admin.ModelAdmin):
@@ -403,7 +506,6 @@ class AssignmentAdmin(admin.ModelAdmin):
     )
     ordering = ("-start_date", "-created_at")
 
-# Ensure only one registration of Assignment, even if this file reloads.
 try:
     admin.site.unregister(Assignment)
 except NotRegistered:

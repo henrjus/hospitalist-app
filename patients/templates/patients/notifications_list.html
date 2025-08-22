@@ -1,0 +1,78 @@
+{% extends "patients/base.html" %}
+
+{% block title %}Notifications · Hospitalist App{% endblock %}
+
+{% block content %}
+  <h1>Your Notifications</h1>
+
+  <!-- Toggle: Unread / All -->
+  <div class="meta" style="margin: 0 0 12px; gap: 12px;">
+    <span>Show:</span>
+    {% if current_filter == "unread" %}
+      <strong>Unread</strong> · <a href="?show=all">All</a>
+    {% else %}
+      <a href="?show=unread">Unread</a> · <strong>All</strong>
+    {% endif %}
+  </div>
+
+  <!-- Mark all as read button
+       Show only if there are unread notifications overall AND
+       (we're on All OR there are items on this Unread page) -->
+  {% if notifications_unread_count|add:0 > 0 %}
+    {% if current_filter != "unread" or notifications %}
+      <form method="post" action="{% url 'patients:notifications_mark_all_read' %}" style="margin: 0 0 12px;">
+        {% csrf_token %}
+        <button type="submit">Mark all as read ({{ notifications_unread_count }})</button>
+      </form>
+    {% endif %}
+  {% endif %}
+
+  {% if notifications %}
+    {% for n in notifications %}
+      <div class="note {% if not n.is_read %}unread{% endif %}">
+        <div class="meta">
+          <span><strong>{{ n.level|title }}</strong></span>
+          <span>Visible: {{ n.visible_at|date:"Y-m-d H:i" }}</span>
+          <span>Created: {{ n.created_at|date:"Y-m-d H:i" }}</span>
+          {% if n.patient %}<span>Patient: {{ n.patient.mrn }} — {{ n.patient.name }}</span>{% endif %}
+          {% if n.is_read %}<span>Read: {{ n.read_at|date:"Y-m-d H:i" }}</span>{% else %}<span><em>Unread</em></span>{% endif %}
+        </div>
+        <div class="msg">{{ n.message }}</div>
+
+        <div class="actions">
+          {% if n.is_read %}
+            <form method="post" action="{% url 'patients:notification_mark_unread' n.pk %}">
+              {% csrf_token %}
+              <button type="submit">Mark unread</button>
+            </form>
+          {% else %}
+            <form method="post" action="{% url 'patients:notification_mark_read' n.pk %}">
+              {% csrf_token %}
+              <button type="submit">Mark read</button>
+            </form>
+          {% endif %}
+        </div>
+      </div>
+    {% endfor %}
+
+    <!-- Simple pager; preserve current filter in links -->
+    <div class="meta" style="justify-content: space-between; align-items: center; margin-top: 12px;">
+      <div>
+        Page {{ page_obj.number }} of {{ paginator.num_pages }}
+      </div>
+      <div style="display:flex; gap:8px;">
+        {% if page_obj.has_previous %}
+          <a href="?show={{ current_filter }}&page=1">« First</a>
+          <a href="?show={{ current_filter }}&page={{ page_obj.previous_page_number }}">‹ Prev</a>
+        {% endif %}
+        {% if page_obj.has_next %}
+          <a href="?show={{ current_filter }}&page={{ page_obj.next_page_number }}">Next ›</a>
+          <a href="?show={{ current_filter }}&page={{ paginator.num_pages }}">Last »</a>
+        {% endif %}
+      </div>
+    </div>
+
+  {% else %}
+    <p class="empty">No notifications.</p>
+  {% endif %}
+{% endblock %}

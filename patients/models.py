@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime
 from django.conf import settings
 from django.db import models
+from django.db.models import Q
 from django.utils import timezone
 
 
@@ -79,12 +81,12 @@ class Patient(models.Model):
         return f"{self.mrn} — {self.name}"
 
     # Convenience helpers for lifecycle transitions
-    def discharge(self, when: timezone.datetime | None = None):
+    def discharge(self, when: datetime | None = None):
         when = when or timezone.now()
         self.status = PatientStatus.DISCHARGED
         self.discharged_at = when
 
-    def archive(self, when: timezone.datetime | None = None):
+    def archive(self, when: datetime | None = None):
         when = when or timezone.now()
         self.status = PatientStatus.ARCHIVED
         self.archived_at = when
@@ -138,8 +140,8 @@ class Todo(models.Model):
 
     class Meta:
         ordering = ("is_completed", "-created_at")
-        verbose_name = "To‑Do"
-        verbose_name_plural = "To‑Dos"
+        verbose_name = "To-Do"
+        verbose_name_plural = "To-Dos"
 
     def __str__(self) -> str:
         return f"Todo for {self.patient.mrn}"
@@ -188,3 +190,91 @@ class Assignment(models.Model):
 
     def __str__(self) -> str:
         return f"{self.patient.mrn} — {self.provider} ({self.role})"
+
+
+# -------------------------------
+# In-App Notifications (P6-C2)
+# -------------------------------
+class Notification(models.Model):
+    class Level(models.TextChoices):
+        INFO = "info", "Info"
+        WARNING = "warning", "Warning"
+        CRITICAL = "critical", "Critical"
+
+    class Kind(models.TextChoices):
+        GENERIC = "generic", "Generic"
+        ASSIGNMENT = "assignment", "Patient Assignment"
+
+    recipient = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="notifications",
+        help_text="User who will see this notification in-app."
+    )
+    message = models.TextField(help_text="Notification body shown to the user.")
+    level = models.CharField(max_length=16, choices=Level.choices, default=Level.INFO)
+
+    # Categorize the notification so we can manage/replace specific kinds (like assignments)
+    kind = models.CharField(max_length=32, choices=Kind.choices, default=Kind.GENERIC, db_index=True)
+
+    # Optional association to a patient (lets us deep-link later)
+    patient = models.ForeignKey("Patient", on_delete=models.SET_NULL, null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    # When the notification becomes visible in the app (used for quiet hours deferral)
+    visible_at = models.DateTimeField(default=timezone.now)
+    read_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("-visible_at", "-created_at")
+        indexes = [
+            models.Index(fields=["recipient", "visible_at"]),
+            models.Index(fields=["level"]),
+            models.Index(fields=["read_at"]),
+            models.Index(fields=["kind", "patient", "visible_at"]),  # for dedupe checks
+            # PostgreSQL partial index for fast "unread" lookups:
+            models.Index(
+                fields=["recipient"],
+                name="notify_unread_idx",
+                condition=Q(read_at__isnull=True),
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"[{self.level}/{self.kind}] → {self.recipient} · {self.visible_at:%Y-%m-%d %H:%M}"
+
+    @property
+    def is_read(self) -> bool:
+        return self.read_at is not None
+
+    def mark_read(self, when: datetime | None = None) -> None:
+        self.read_at = when or timezone.now()
+        self.save(update_fields=["read_at"])
+
+    def mark_unread(self) -> None:
+        self.read_at = None
+        self.save(update_fields=["read_at"])
+
+    @classmethod
+    def push(
+        cls,
+        *,
+        recipient,
+        message: str,
+        level: str = Level.INFO,
+        patient: Patient | None = None,
+        visible_at: datetime | None = None,
+        kind: str = Kind.GENERIC,
+    ) -> "Notification":
+        """
+        Centralized creator for notifications. In the future, you can also fan-out here
+        (e.g., SMS/email) without changing callers.
+        """
+        return cls.objects.create(
+            recipient=recipient,
+            message=message,
+            level=level,
+            patient=patient,
+            visible_at=visible_at or timezone.now(),
+            kind=kind,
+        )
