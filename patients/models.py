@@ -278,3 +278,81 @@ class Notification(models.Model):
             visible_at=visible_at or timezone.now(),
             kind=kind,
         )
+
+
+# -------------------------------
+# Patient Watch (private lists)
+# -------------------------------
+class PatientWatch(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="watched_patients",
+    )
+    patient = models.ForeignKey(
+        "patients.Patient",
+        on_delete=models.CASCADE,
+        related_name="watchers",
+    )
+    note = models.CharField(max_length=200, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    archived_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "patient"],
+                name="uniq_active_watch_per_user_patient",
+                condition=Q(archived_at__isnull=True),
+            )
+        ]
+        indexes = [
+            models.Index(fields=["user", "created_at"]),
+            models.Index(fields=["patient", "created_at"]),
+        ]
+
+    def __str__(self):
+        status = "active" if self.archived_at is None else "archived"
+        return f"{self.user} → {self.patient} ({status})"
+
+
+# -------------------------------
+# Audit Trail (P6-C3) — Step 1
+# -------------------------------
+class AuditLog(models.Model):
+    class Event(models.TextChoices):
+        ATTENDING_CHANGED = "ATTENDING_CHANGED", "Attending changed"
+
+    event = models.CharField(max_length=40, choices=Event.choices)
+    patient = models.ForeignKey("patients.Patient", on_delete=models.CASCADE, related_name="audit_logs")
+    changed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="patient_audit_logs",
+    )
+    old_attending = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="audit_old_attending",
+    )
+    new_attending = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="audit_new_attending",
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["event", "created_at"]),
+            models.Index(fields=["patient", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"[{self.created_at:%Y-%m-%d %H:%M}] {self.get_event_display()} — {self.patient}"

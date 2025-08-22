@@ -1,16 +1,26 @@
 from datetime import date, datetime, time, timedelta
+
 from django import forms
+from django.conf import settings
 from django.contrib import admin, messages
-from django.contrib.admin.sites import NotRegistered
 from django.contrib.admin import SimpleListFilter
 from django.contrib.admin.helpers import ActionForm
+from django.contrib.admin.sites import NotRegistered
 from django.contrib.auth import get_user_model
-from django.conf import settings
+from django.db import transaction
+from django.db.models import Exists, OuterRef
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
-from django.db import transaction
 
-from .models import Patient, PatientStatus, Signout, Todo, OvernightEvent, Assignment, Notification
+from django.urls import path
+from django.shortcuts import redirect
+from django.utils.html import format_html
+
+
+from .models import (
+    Patient, PatientStatus, Signout, Todo, OvernightEvent,
+    Assignment, Notification, AuditLog, PatientWatch
+)
 
 User = get_user_model()
 
@@ -58,7 +68,6 @@ def _next_visible_time(now: timezone.datetime) -> timezone.datetime:
         return now
     local_now = timezone.localtime(now)
     tz = timezone.get_current_timezone()
-    # If before END, deliver today at END; else tomorrow at END
     deliver_date = local_now.date() if local_now.hour < QUIET_END_HOUR else (local_now.date() + timedelta(days=1))
     naive = datetime.combine(deliver_date, time(hour=QUIET_END_HOUR, minute=0))
     return timezone.make_aware(naive, tz)
@@ -130,6 +139,107 @@ class StatusListFilter(SimpleListFilter):
             return queryset.filter(status=value)
         return queryset
 
+class MyWatchlistFilter(SimpleListFilter):
+    parameter_name = "my_watch"
+
+    def __init__(self, request, *args, **kwargs):
+        # keep request so we can compute per-user counts and title
+        self.request = request
+        super().__init__(request, *args, **kwargs)
+
+    @property
+    def title(self):
+        # Sidebar header shows total active items on *my* watchlist
+        from .models import PatientWatch
+        total = PatientWatch.objects.filter(
+            user=self.request.user,
+            archived_at__isnull=True,
+        ).count()
+        return f"My watchlist ({total})"
+
+    def lookups(self, request, model_admin):
+        """
+        Show counts in the option labels, scoped to the current list view
+        (respects other active filters/search since we use model_admin.get_queryset).
+        """
+        base_qs = model_admin.get_queryset(request)
+
+        yes_count = (
+            base_qs.filter(
+                watchers__user=request.user,
+                watchers__archived_at__isnull=True,
+            )
+            .distinct()
+            .count()
+        )
+        no_count = (
+            base_qs.exclude(
+                watchers__user=request.user,
+                watchers__archived_at__isnull=True,
+            )
+            .distinct()
+            .count()
+        )
+
+        return [
+            ("yes", f"Yes ({yes_count})"),
+            ("no", f"No ({no_count})"),
+        ]
+
+    def queryset(self, request, queryset):
+        if self.value() == "yes":
+            return queryset.filter(
+                watchers__user=request.user,
+                watchers__archived_at__isnull=True,
+            )
+        if self.value() == "no":
+            return queryset.exclude(
+                watchers__user=request.user,
+                watchers__archived_at__isnull=True,
+            )
+        return queryset
+
+
+# ========== PatientWatch Admin & Actions ==========
+
+@admin.register(PatientWatch)
+class PatientWatchAdmin(admin.ModelAdmin):
+    list_display = ("patient", "user", "note", "created_at", "archived_at")
+    list_filter = ("user", ("archived_at", admin.EmptyFieldListFilter))
+    search_fields = ("patient__mrn", "patient__name", "user__username", "note")
+    ordering = ("-created_at",)
+
+@admin.action(description="Add to MY watchlist")
+def add_to_my_watchlist(modeladmin, request, queryset):
+    created, reactivated, skipped = 0, 0, 0
+    for patient in queryset:
+        if PatientWatch.objects.filter(user=request.user, patient=patient, archived_at__isnull=True).exists():
+            skipped += 1
+            continue
+        if PatientWatch.objects.filter(user=request.user, patient=patient, archived_at__isnull=False).exists():
+            PatientWatch.objects.filter(
+                user=request.user, patient=patient, archived_at__isnull=False
+            ).update(archived_at=None)
+            reactivated += 1
+            continue
+        PatientWatch.objects.create(user=request.user, patient=patient, note="")
+        created += 1
+
+    modeladmin.message_user(
+        request,
+        f"Watchlist updated — created: {created}, reactivated: {reactivated}, skipped (already active): {skipped}.",
+        level=messages.SUCCESS,
+    )
+
+@admin.action(description="Remove from MY watchlist")
+def remove_from_my_watchlist(modeladmin, request, queryset):
+    updated = (
+        PatientWatch.objects
+        .filter(user=request.user, patient__in=queryset, archived_at__isnull=True)
+        .update(archived_at=timezone.now())
+    )
+    modeladmin.message_user(request, f"Removed {updated} patient(s) from your watchlist.", level=messages.SUCCESS)
+
 # ========== Patients Admin (with Attending FK + Bulk Action + Lifecycle) ==========
 
 class SetAttendingActionForm(ActionForm):
@@ -162,6 +272,8 @@ class PatientAdmin(admin.ModelAdmin):
         "los_days",
         "location",
         "attending",
+        "on_my_watchlist",   # column already present
+        "watch_toggle_link", # <-- NEW: per-row toggle link
         "admit_display",
         "status",
         "discharged_at",
@@ -173,6 +285,7 @@ class PatientAdmin(admin.ModelAdmin):
         "attending",
         "admission_date",
         StatusListFilter,
+        MyWatchlistFilter,
     )
     search_fields = (
         "mrn",
@@ -208,11 +321,109 @@ class PatientAdmin(admin.ModelAdmin):
         }),
     )
 
+    actions = ["add_to_my_watchlist_inline", "remove_from_my_watchlist_inline"]
+
+    # ---------- Watchlist bulk actions ----------
+    @admin.action(description="➕ Add selected to *my* watchlist")
+    def add_to_my_watchlist_inline(self, request, queryset):
+        from django.utils import timezone
+        from .models import PatientWatch
+        created, reactivated = 0, 0
+        for patient in queryset:
+            qs = PatientWatch.objects.filter(user=request.user, patient=patient)
+            if qs.filter(archived_at__isnull=True).exists():
+                continue
+            if qs.filter(archived_at__isnull=False).exists():
+                qs.update(archived_at=None)
+                reactivated += 1
+                continue
+            PatientWatch.objects.create(user=request.user, patient=patient, note="")
+            created += 1
+        self.message_user(
+            request,
+            f"Added to your watchlist — created: {created}, reactivated: {reactivated}.",
+            level=messages.SUCCESS,
+        )
+
+    @admin.action(description="➖ Remove selected from *my* watchlist")
+    def remove_from_my_watchlist_inline(self, request, queryset):
+        from django.utils import timezone
+        from .models import PatientWatch
+        qs = PatientWatch.objects.filter(user=request.user, patient__in=queryset, archived_at__isnull=True)
+        count = qs.count()
+        qs.update(archived_at=timezone.now())
+        self.message_user(request, f"Removed {count} patient(s) from your watchlist.", level=messages.SUCCESS)
+
+    # ---------- Quick toggle: Watch / Unwatch (per-row link) ----------
+    def get_urls(self):
+        from django.urls import path
+        urls = super().get_urls()
+        custom = [
+            path(
+                "<int:patient_id>/toggle-watch/",
+                self.admin_site.admin_view(self.toggle_watch),  # admin-protected
+                name="patients_patient_toggle_watch",
+            ),
+        ]
+        return custom + urls
+
+    def toggle_watch(self, request, patient_id: int):
+        """Toggle current user's watch (create/reactivate if missing, else archive)."""
+        from django.utils import timezone
+        from .models import Patient, PatientWatch
+
+        patient = Patient.objects.filter(pk=patient_id).first()
+        if not patient:
+            return redirect(request.META.get("HTTP_REFERER", ".."))
+
+        qs = PatientWatch.objects.filter(user=request.user, patient=patient)
+        # If active exists -> archive it (unwatch)
+        if qs.filter(archived_at__isnull=True).exists():
+            qs.update(archived_at=timezone.now())
+            self.message_user(request, f"Removed {patient.name} from your watchlist.", level=messages.SUCCESS)
+        # Else if archived exists -> reactivate
+        elif qs.filter(archived_at__isnull=False).exists():
+            qs.update(archived_at=None)
+            self.message_user(request, f"Re‑added {patient.name} to your watchlist.", level=messages.SUCCESS)
+        # Else create new
+        else:
+            PatientWatch.objects.create(user=request.user, patient=patient, note="")
+            self.message_user(request, f"Added {patient.name} to your watchlist.", level=messages.SUCCESS)
+
+        # Go back to wherever you came from (keeps filters/sorting)
+        return redirect(request.META.get("HTTP_REFERER", ".."))
+
+    @admin.display(description="Watch toggle")
+    def watch_toggle_link(self, obj):
+        """Render a small Watch/Unwatch link per row."""
+        is_on = bool(getattr(obj, "_on_my_watch", False))
+        label = "Unwatch" if is_on else "Watch"
+        return format_html('<a href="{}/toggle-watch/">{}</a>', obj.pk, label)
+
+
     readonly_fields = ("created_at", "updated_at", "discharged_at", "archived_at")
+
+    # Efficiently annotate whether each row is on *my* watchlist
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        return qs.annotate(
+            _on_my_watch=Exists(
+                PatientWatch.objects.filter(
+                    user=request.user,
+                    patient_id=OuterRef("pk"),
+                    archived_at__isnull=True,
+                )
+            )
+        )
+
+    @admin.display(boolean=True, description="My watch?")
+    def on_my_watchlist(self, obj):
+        return bool(getattr(obj, "_on_my_watch", False))
 
     def changelist_view(self, request, extra_context=None):
         if "status__exact" not in request.GET:
             ref = request.META.get("HTTP_REFERER", "")
+            # If landing fresh (no referrer) and no explicit filter, default to Active
             if not ref:
                 q = request.GET.copy()
                 q["status__exact"] = PatientStatus.ACTIVE
@@ -259,6 +470,8 @@ class PatientAdmin(admin.ModelAdmin):
         "mark_active",
         "discharge_now",
         "archive_now",
+        add_to_my_watchlist,
+        remove_from_my_watchlist,
     ]
 
     @admin.action(description="Mark Active (clear discharge/archive timestamps)")
@@ -315,6 +528,7 @@ class PatientAdmin(admin.ModelAdmin):
                 updated = 0
                 for p in queryset.select_for_update():
                     if p.attending_id != tba_user.id:
+                        p._changed_by_user = request.user  # ensure audit 'changed_by'
                         p.attending = tba_user
                         p.save(update_fields=["attending"])
                         updated += 1
@@ -337,10 +551,10 @@ class PatientAdmin(admin.ModelAdmin):
                 updated = 0
                 for p in queryset.select_for_update():
                     if p.attending_id != user.id:
+                        p._changed_by_user = request.user  # ensure audit 'changed_by'
                         p.attending = user
                         p.save(update_fields=["attending"])
                         updated += 1
-                        # Queue notification for the new attending
                         if user.username != "to_be_assigned":
                             self._notify_assignment(p, user)
 
@@ -395,6 +609,8 @@ class PatientAdmin(admin.ModelAdmin):
         return form
 
     def save_model(self, request, obj, form, change):
+        obj._changed_by_user = request.user  # ensure audit 'changed_by'
+
         prev_attending = None
         if change and obj.pk and "attending" in getattr(form, "changed_data", []):
             try:
@@ -511,3 +727,19 @@ try:
 except NotRegistered:
     pass
 admin.site.register(Assignment, AssignmentAdmin)
+
+# ========== Audit Logs Admin ==========
+@admin.register(AuditLog)
+class AuditLogAdmin(admin.ModelAdmin):
+    list_display = ("created_at", "patient", "event", "old_attending", "new_attending", "changed_by")
+    list_filter = ("event", ("created_at", admin.DateFieldListFilter), "changed_by")
+    search_fields = (
+        "patient__mrn",
+        "patient__name",
+        "changed_by__username",
+        "changed_by__first_name",
+        "changed_by__last_name",
+        "old_attending__username",
+        "new_attending__username",
+    )
+    ordering = ("-created_at",)

@@ -32,7 +32,7 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'patients',
+    'patients.apps.PatientsConfig',  # use AppConfig so signals load in ready()
 ]
 
 MIDDLEWARE = [
