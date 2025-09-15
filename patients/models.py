@@ -360,14 +360,29 @@ class PatientWatch(models.Model):
 
 
 # -------------------------------
-# Audit Trail (P6-C3) — Step 1
+# Audit Trail (P6-C3) — Auth + Patient events
 # -------------------------------
 class AuditLog(models.Model):
     class Event(models.TextChoices):
+        # Patient-related events
         ATTENDING_CHANGED = "ATTENDING_CHANGED", "Attending changed"
+        # Auth-related events
+        LOGIN_SUCCESS = "LOGIN_SUCCESS", "Login success"
+        LOGIN_FAILED = "LOGIN_FAILED", "Login failed"
+        LOGOUT = "LOGOUT", "Logout"
 
     event = models.CharField(max_length=40, choices=Event.choices)
-    patient = models.ForeignKey("patients.Patient", on_delete=models.CASCADE, related_name="audit_logs")
+
+    # Optional patient link (only for patient-related events)
+    patient = models.ForeignKey(
+        "patients.Patient",
+        on_delete=models.CASCADE,
+        related_name="audit_logs",
+        null=True,
+        blank=True,
+    )
+
+    # Actor (if known; user who triggered the event)
     changed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         null=True,
@@ -375,6 +390,8 @@ class AuditLog(models.Model):
         on_delete=models.SET_NULL,
         related_name="patient_audit_logs",
     )
+
+    # For ATTENDING_CHANGED
     old_attending = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         null=True,
@@ -389,13 +406,23 @@ class AuditLog(models.Model):
         on_delete=models.SET_NULL,
         related_name="audit_new_attending",
     )
+
+    # For auth events (login/logout/failed)
+    username = models.CharField(max_length=150, blank=True, default="")
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.TextField(blank=True, default="")
+
     created_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
         indexes = [
             models.Index(fields=["event", "created_at"]),
             models.Index(fields=["patient", "created_at"]),
+            models.Index(fields=["username", "created_at"]),
         ]
+        ordering = ("-created_at",)
 
     def __str__(self) -> str:
-        return f"[{self.created_at:%Y-%m-%d %H:%M}] {self.get_event_display()} — {self.patient}"
+        who = self.username or (self.changed_by.get_username() if self.changed_by else "unknown")
+        return f"[{self.created_at:%Y-%m-%d %H:%M}] {self.get_event_display()} — {who}"
+
