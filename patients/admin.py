@@ -1,4 +1,5 @@
 from datetime import date, datetime, time, timedelta
+from typing import TYPE_CHECKING
 
 from django import forms
 from django.conf import settings
@@ -15,13 +16,15 @@ from django.utils.translation import gettext_lazy as _
 from django.urls import path
 from django.shortcuts import redirect
 from django.utils.html import format_html
-from .models import Patient
-
 
 from .models import (
     Patient, PatientStatus, Signout, Todo, OvernightEvent,
     Assignment, Notification, AuditLog, PatientWatch
 )
+
+# --- for editor type checking only; no runtime import cycles ---
+if TYPE_CHECKING:
+    from django.contrib.auth.models import AbstractUser as User
 
 User = get_user_model()
 
@@ -297,7 +300,8 @@ class PatientAdmin(admin.ModelAdmin):
     )
     search_fields = (
         "mrn",
-        "name",
+        "last_name",
+        "first_name",
         "diagnosis",
         "attending__username",
         "attending__first_name",
@@ -329,12 +333,10 @@ class PatientAdmin(admin.ModelAdmin):
         }),
     )
 
-
     # --- NEW: Age display column (computed from model property) ---
     @admin.display(description="Age", ordering="dob")
     def age_display(self, obj: Patient):
         return obj.age_years
-
 
     actions = ["add_to_my_watchlist_inline", "remove_from_my_watchlist_inline"]
 
@@ -399,7 +401,7 @@ class PatientAdmin(admin.ModelAdmin):
         # Else if archived exists -> reactivate
         elif qs.filter(archived_at__isnull=False).exists():
             qs.update(archived_at=None)
-            self.message_user(request, f"Re‑added {patient.name} to your watchlist.", level=messages.SUCCESS)
+            self.message_user(request, f"Re-added {patient.name} to your watchlist.", level=messages.SUCCESS)
         # Else create new
         else:
             PatientWatch.objects.create(user=request.user, patient=patient, note="")
@@ -414,7 +416,6 @@ class PatientAdmin(admin.ModelAdmin):
         is_on = bool(getattr(obj, "_on_my_watch", False))
         label = "Unwatch" if is_on else "Watch"
         return format_html('<a href="{}/toggle-watch/">{}</a>', obj.pk, label)
-
 
     readonly_fields = ("created_at", "updated_at", "discharged_at", "archived_at")
 
@@ -447,25 +448,30 @@ class PatientAdmin(admin.ModelAdmin):
         return super().changelist_view(request, extra_context=extra_context)
 
     # ---------- Notification helpers ----------
-    def _notify_assignment(self, patient: Patient, new_attending: User):
+    def _notify_assignment(self, patient: "Patient", new_attending: "User") -> None:
         """
         Create/queue a notification to the assigned hospitalist.
-        Dedupes: removes any *pending* (future-visible) assignment notifications
-        for this patient so only the final pre-7AM assignment fires.
+
+        Dedupe rule:
+          - Remove any *pending* (future-visible) assignment notifications
+            for this same patient/recipient so only the final pre-7AM
+            assignment fires (quiet-hours consolidation).
         """
         now = timezone.now()
         visible_at = _next_visible_time(now)
 
-        # 1) Cancel any pending overnight assignment notifications for this patient
+        # 1) Cancel any pending overnight assignment notifications for this patient+recipient
         Notification.objects.filter(
-            kind=Notification.Kind.ASSIGNMENT,
+            recipient=new_attending,
             patient=patient,
-            visible_at__gt=now,  # future-visible (e.g., next 7 AM)
+            kind=Notification.Kind.ASSIGNMENT,
+            visible_at__gt=now,        # future-visible (e.g., next 7 AM)
+            read_at__isnull=True,
         ).delete()
 
         # 2) Push the latest assignment notification (respecting quiet hours)
         msg = (
-            f"New patient assigned to you: {patient.mrn} — {patient.name}."
+            f"New patient assigned to you: {patient.mrn or '—'} — {patient.name}."
             f" Location: {patient.location or '—'}."
             f" Dx: {patient.diagnosis or '—'}."
         )
@@ -624,27 +630,39 @@ class PatientAdmin(admin.ModelAdmin):
         return form
 
     def save_model(self, request, obj, form, change):
+        """
+        - Preserve your attendings notification logic
+        - Add lifecycle timestamp setting when Status changes via Admin form
+        """
         obj._changed_by_user = request.user  # ensure audit 'changed_by'
 
+        # Capture previous object (for status/attending diffs)
         prev_attending = None
-        if change and obj.pk and "attending" in getattr(form, "changed_data", []):
+        old_status = None
+        if change and obj.pk:
             try:
                 prev = Patient.objects.get(pk=obj.pk)
                 prev_attending = prev.attending
+                old_status = prev.status
             except Patient.DoesNotExist:
                 prev_attending = None
+                old_status = None
+
+        # If Status changed, set missing timestamps BEFORE saving
+        if old_status != obj.status:
+            if obj.status == PatientStatus.DISCHARGED and not obj.discharged_at:
+                obj.discharge()  # sets status + discharged_at once
+            elif obj.status == PatientStatus.ARCHIVED and not obj.archived_at:
+                obj.archive()    # sets status + archived_at once
 
         super().save_model(request, obj, form, change)
 
+        # After save: if attending changed, notify (skip placeholder)
         if change and "attending" in getattr(form, "changed_data", []):
             new_attending = obj.attending
             if new_attending and (not prev_attending or prev_attending.id != new_attending.id):
                 if getattr(new_attending, "username", None) != "to_be_assigned":
                     self._notify_assignment(obj, new_attending)
-
-    @admin.display(description="Age", ordering="dob")
-    def age_years(self, obj: Patient):
-        return _calc_age(obj.dob) or "—"
 
     @admin.display(description="LOS (d)")
     def los_days(self, obj: Patient):

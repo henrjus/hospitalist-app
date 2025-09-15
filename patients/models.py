@@ -43,11 +43,11 @@ class Patient(models.Model):
     location = models.CharField(max_length=100, blank=True)
     diagnosis = models.CharField(max_length=255, blank=True)
 
-    # NEW: Admission-day narrative / key summary
+    # Admission-day narrative / key summary
     patient_information = models.TextField(
         "Patient Information",
         blank=True,
-        help_text="Admission-day narrative or key summary for this patient."
+        help_text="Admission-day narrative or key summary for this patient.",
     )
 
     admission_date = models.DateField(null=True, blank=True)
@@ -62,7 +62,7 @@ class Patient(models.Model):
         blank=False,                # enforce required in admin/forms
     )
 
-    # ↓↓↓ NEW LIFECYCLE FIELDS ↓↓↓
+    # ↓↓↓ LIFECYCLE FIELDS ↓↓↓
     status = models.CharField(
         max_length=16,
         choices=PatientStatus.choices,
@@ -115,14 +115,24 @@ class Patient(models.Model):
 
     # Convenience helpers for lifecycle transitions
     def discharge(self, when: datetime | None = None):
+        """
+        Set status to DISCHARGED and stamp discharged_at once.
+        Does not call save(); caller decides when to save.
+        """
         when = when or timezone.now()
         self.status = PatientStatus.DISCHARGED
-        self.discharged_at = when
+        if self.discharged_at is None:
+            self.discharged_at = when
 
     def archive(self, when: datetime | None = None):
+        """
+        Set status to ARCHIVED and stamp archived_at once.
+        Does not call save(); caller decides when to save.
+        """
         when = when or timezone.now()
         self.status = PatientStatus.ARCHIVED
-        self.archived_at = when
+        if self.archived_at is None:
+            self.archived_at = when
 
     @property
     def is_read_only(self) -> bool:
@@ -242,7 +252,7 @@ class Notification(models.Model):
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name="notifications",
-        help_text="User who will see this notification in-app."
+        help_text="User who will see this notification in-app.",
     )
     message = models.TextField(help_text="Notification body shown to the user.")
     level = models.CharField(max_length=16, choices=Level.choices, default=Level.INFO)
