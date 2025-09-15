@@ -26,7 +26,16 @@ class PatientStatus(models.TextChoices):
 class Patient(models.Model):
     # Core identifiers & demographics
     mrn = models.CharField(max_length=50, blank=True, null=True)
+
+    # Structured name fields (new)
+    last_name = models.CharField(max_length=100)
+    first_name = models.CharField(max_length=100)
+    middle_name = models.CharField(max_length=100, blank=True)
+    suffix = models.CharField(max_length=50, blank=True)
+
+    # Legacy combined name (kept during transition; auto-synced in save())
     name = models.CharField(max_length=200)
+
     dob = models.DateField("Date of Birth")
     sex = models.CharField(max_length=1, choices=SEX_CHOICES, default="U")
 
@@ -66,6 +75,20 @@ class Patient(models.Model):
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    # Keep legacy "name" field in sync for backward compatibility
+    def save(self, *args, **kwargs):
+        parts = [
+            (self.last_name or "").strip(),
+            (self.first_name or "").strip(),
+        ]
+        full = ", ".join([p for p in parts if p])  # "Last, First"
+        if self.middle_name:
+            full += f" {self.middle_name.strip()}"
+        if self.suffix:
+            full += f", {self.suffix.strip()}"
+        self.name = full.strip()
+        super().save(*args, **kwargs)
 
     # Computed age in full years from DOB (read-only; not stored in DB)
     @property

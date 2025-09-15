@@ -284,6 +284,9 @@ class PatientAdmin(admin.ModelAdmin):
     )
     list_display_links = ("name",)
 
+    # Hide legacy combined name field from the form
+    exclude = ("name",)
+
     list_filter = (
         "sex",
         "location",
@@ -309,7 +312,7 @@ class PatientAdmin(admin.ModelAdmin):
 
     fieldsets = (
         ("Identifiers", {
-            "fields": ("mrn", "name", "dob", "sex")
+            "fields": ("mrn", "last_name", "first_name", "middle_name", "suffix", "dob", "sex")
         }),
         ("Clinical / Census", {
             "fields": ("location", "diagnosis", "admission_date", "admission_time", "attending")
@@ -325,6 +328,7 @@ class PatientAdmin(admin.ModelAdmin):
             "fields": ("patient_information",),
         }),
     )
+
 
     # --- NEW: Age display column (computed from model property) ---
     @admin.display(description="Age", ordering="dob")
