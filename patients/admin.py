@@ -25,8 +25,10 @@ from .models import (
 # --- for editor type checking only; no runtime import cycles ---
 if TYPE_CHECKING:
     from django.contrib.auth.models import AbstractUser as User
+    from .models import Patient  # forward-ref support for type hints
 
-User = get_user_model()
+# Runtime model class for queries
+UserModel = get_user_model()
 
 # ========== Helpers ==========
 
@@ -248,7 +250,7 @@ def remove_from_my_watchlist(modeladmin, request, queryset):
 
 class SetAttendingActionForm(ActionForm):
     attending = forms.ModelChoiceField(
-        queryset=User.objects.filter(is_active=True).order_by("last_name", "first_name", "username"),
+        queryset=UserModel.objects.filter(is_active=True).order_by("last_name", "first_name", "username"),
         required=False,
         label="Assign attending"
     )
@@ -335,7 +337,7 @@ class PatientAdmin(admin.ModelAdmin):
 
     # --- NEW: Age display column (computed from model property) ---
     @admin.display(description="Age", ordering="dob")
-    def age_display(self, obj: Patient):
+    def age_display(self, obj: "Patient"):
         return obj.age_years
 
     actions = ["add_to_my_watchlist_inline", "remove_from_my_watchlist_inline"]
@@ -534,8 +536,8 @@ class PatientAdmin(admin.ModelAdmin):
 
         # Resolve placeholder user
         try:
-            tba_user = User.objects.get(username="to_be_assigned")
-        except User.DoesNotExist:
+            tba_user = UserModel.objects.get(username="to_be_assigned")
+        except UserModel.DoesNotExist:
             self.message_user(
                 request,
                 "Placeholder user 'to_be_assigned' was not found. Please run migrations again.",
@@ -563,8 +565,8 @@ class PatientAdmin(admin.ModelAdmin):
         # ASSIGN: set to selected user and notify them
         if attending_id:
             try:
-                user = User.objects.get(pk=attending_id)
-            except User.DoesNotExist:
+                user = UserModel.objects.get(pk=attending_id)
+            except UserModel.DoesNotExist:
                 self.message_user(request, "Selected Attending user not found.", level=messages.ERROR)
                 return
 
@@ -614,9 +616,9 @@ class PatientAdmin(admin.ModelAdmin):
     def get_changeform_initial_data(self, request):
         initial = super().get_changeform_initial_data(request)
         try:
-            tba_user = User.objects.get(username="to_be_assigned")
+            tba_user = UserModel.objects.get(username="to_be_assigned")
             initial.setdefault("attending", tba_user.pk)
-        except User.DoesNotExist:
+        except UserModel.DoesNotExist:
             pass
         return initial
 
@@ -665,11 +667,11 @@ class PatientAdmin(admin.ModelAdmin):
                     self._notify_assignment(obj, new_attending)
 
     @admin.display(description="LOS (d)")
-    def los_days(self, obj: Patient):
+    def los_days(self, obj: "Patient"):
         return _calc_los(obj.admission_date, obj.admission_time) or "—"
 
     @admin.display(description="Admit", ordering="admission_date")
-    def admit_display(self, obj: Patient):
+    def admit_display(self, obj: "Patient"):
         if not obj.admission_date:
             return "—"
         if obj.admission_time:
