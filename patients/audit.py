@@ -67,3 +67,44 @@ def audit_logout(sender, request, user, **kwargs):
         ip_address=_get_ip(request),
         user_agent=_get_user_agent(request),
     )
+
+
+# --- Patient attending change auditing ---
+from django.db.models.signals import pre_save, post_save
+from .models import Patient  # reuse AuditLog already imported above
+
+@receiver(pre_save, sender=Patient)
+def _audit_patient_attending_pre(sender, instance: Patient, **kwargs):
+    """
+    Capture the previous attending_id before save so post_save can compare.
+    """
+    if instance.pk:
+        try:
+            prev = Patient.objects.only("attending_id").get(pk=instance.pk)
+            instance.__prev_attending_id = prev.attending_id
+        except Patient.DoesNotExist:
+            instance.__prev_attending_id = None
+    else:
+        instance.__prev_attending_id = None
+
+
+@receiver(post_save, sender=Patient)
+def _audit_patient_attending_post(sender, instance: Patient, created: bool, **kwargs):
+    """
+    If attending changed, write an ATTENDING_CHANGED AuditLog row.
+    Uses instance._changed_by_user set in admin actions/forms when available.
+    """
+    if created:
+        return
+    prev_id = getattr(instance, "__prev_attending_id", None)
+    new_id = instance.attending_id
+    if prev_id == new_id:
+        return
+
+    AuditLog.objects.create(
+        event=AuditLog.Event.ATTENDING_CHANGED,
+        patient=instance,
+        changed_by=getattr(instance, "_changed_by_user", None),
+        old_attending_id=prev_id,
+        new_attending_id=new_id,
+    )
