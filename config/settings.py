@@ -32,7 +32,8 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'patients.apps.PatientsConfig',  # use AppConfig so signals load in ready()
+    # Use AppConfig so audit signals load in ready()
+    'patients.apps.PatientsConfig',
 ]
 
 MIDDLEWARE = [
@@ -100,22 +101,16 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # ---------------------------
 # Patients lifecycle settings
 # ---------------------------
-# How many days a patient remains in the 'Discharged' state (read-only, still visible)
-# before being auto-archived by a scheduled task/command.
 PATIENT_DISCHARGE_GRACE_DAYS = 7
 
 # ---------------------------
 # Notifications (quiet hours)
 # ---------------------------
-# Local hours when notifications are deferred (used by admin trigger).
-# Change these if your schedule changes.
 NOTIFY_QUIET_START_HOUR = 16  # 4 PM local
 NOTIFY_QUIET_END_HOUR = 7     # 7 AM local
 
 # ---------------------------
 # Auth redirects
 # ---------------------------
-# If a user hits /notifications/ while logged out, send them to Admin login;
-# upon login, land them back on the notifications page.
 LOGIN_URL = "/admin/login/"
 LOGIN_REDIRECT_URL = "/notifications/"
