@@ -25,29 +25,20 @@ class PatientStatus(models.TextChoices):
 
 class Patient(models.Model):
     # Core identifiers & demographics
-    mrn = models.CharField(max_length=50, blank=True, null=True)
-
-    # Structured name fields (new)
-    last_name = models.CharField(max_length=100)
-    first_name = models.CharField(max_length=100)
-    middle_name = models.CharField(max_length=100, blank=True)
-    suffix = models.CharField(max_length=50, blank=True)
-
-    # Legacy combined name (kept during transition; auto-synced in save())
+    mrn = models.CharField("MRN", max_length=32, unique=True)
     name = models.CharField(max_length=200)
-
-    dob = models.DateField("Date of Birth")
+    dob = models.DateField("Date of Birth", null=True, blank=True)
     sex = models.CharField(max_length=1, choices=SEX_CHOICES, default="U")
 
     # Clinical/census fields
     location = models.CharField(max_length=100, blank=True)
     diagnosis = models.CharField(max_length=255, blank=True)
 
-    # Admission-day narrative / key summary
+    # NEW: Admission-day narrative / key summary
     patient_information = models.TextField(
         "Patient Information",
         blank=True,
-        help_text="Admission-day narrative or key summary for this patient.",
+        help_text="Admission-day narrative or key summary for this patient."
     )
 
     admission_date = models.DateField(null=True, blank=True)
@@ -62,7 +53,7 @@ class Patient(models.Model):
         blank=False,                # enforce required in admin/forms
     )
 
-    # ↓↓↓ LIFECYCLE FIELDS ↓↓↓
+    # ↓↓↓ NEW LIFECYCLE FIELDS ↓↓↓
     status = models.CharField(
         max_length=16,
         choices=PatientStatus.choices,
@@ -75,30 +66,6 @@ class Patient(models.Model):
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-
-    # Keep legacy "name" field in sync for backward compatibility
-    def save(self, *args, **kwargs):
-        parts = [
-            (self.last_name or "").strip(),
-            (self.first_name or "").strip(),
-        ]
-        full = ", ".join([p for p in parts if p])  # "Last, First"
-        if self.middle_name:
-            full += f" {self.middle_name.strip()}"
-        if self.suffix:
-            full += f", {self.suffix.strip()}"
-        self.name = full.strip()
-        super().save(*args, **kwargs)
-
-    # Computed age in full years from DOB (read-only; not stored in DB)
-    @property
-    def age_years(self):
-        if not self.dob:
-            return None
-        today = timezone.now().date()
-        return today.year - self.dob.year - (
-            (today.month, today.day) < (self.dob.month, self.dob.day)
-        )
 
     class Meta:
         ordering = ("-admission_date", "-admission_time", "-created_at")
@@ -115,24 +82,14 @@ class Patient(models.Model):
 
     # Convenience helpers for lifecycle transitions
     def discharge(self, when: datetime | None = None):
-        """
-        Set status to DISCHARGED and stamp discharged_at once.
-        Does not call save(); caller decides when to save.
-        """
         when = when or timezone.now()
         self.status = PatientStatus.DISCHARGED
-        if self.discharged_at is None:
-            self.discharged_at = when
+        self.discharged_at = when
 
     def archive(self, when: datetime | None = None):
-        """
-        Set status to ARCHIVED and stamp archived_at once.
-        Does not call save(); caller decides when to save.
-        """
         when = when or timezone.now()
         self.status = PatientStatus.ARCHIVED
-        if self.archived_at is None:
-            self.archived_at = when
+        self.archived_at = when
 
     @property
     def is_read_only(self) -> bool:
@@ -252,7 +209,7 @@ class Notification(models.Model):
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name="notifications",
-        help_text="User who will see this notification in-app.",
+        help_text="User who will see this notification in-app."
     )
     message = models.TextField(help_text="Notification body shown to the user.")
     level = models.CharField(max_length=16, choices=Level.choices, default=Level.INFO)
@@ -360,29 +317,14 @@ class PatientWatch(models.Model):
 
 
 # -------------------------------
-# Audit Trail (P6-C3) — Auth + Patient events
+# Audit Trail (P6-C3) — Step 1
 # -------------------------------
 class AuditLog(models.Model):
     class Event(models.TextChoices):
-        # Patient-related events
         ATTENDING_CHANGED = "ATTENDING_CHANGED", "Attending changed"
-        # Auth-related events
-        LOGIN_SUCCESS = "LOGIN_SUCCESS", "Login success"
-        LOGIN_FAILED = "LOGIN_FAILED", "Login failed"
-        LOGOUT = "LOGOUT", "Logout"
 
     event = models.CharField(max_length=40, choices=Event.choices)
-
-    # Optional patient link (only for patient-related events)
-    patient = models.ForeignKey(
-        "patients.Patient",
-        on_delete=models.CASCADE,
-        related_name="audit_logs",
-        null=True,
-        blank=True,
-    )
-
-    # Actor (if known; user who triggered the event)
+    patient = models.ForeignKey("patients.Patient", on_delete=models.CASCADE, related_name="audit_logs")
     changed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         null=True,
@@ -390,8 +332,6 @@ class AuditLog(models.Model):
         on_delete=models.SET_NULL,
         related_name="patient_audit_logs",
     )
-
-    # For ATTENDING_CHANGED
     old_attending = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         null=True,
@@ -406,23 +346,13 @@ class AuditLog(models.Model):
         on_delete=models.SET_NULL,
         related_name="audit_new_attending",
     )
-
-    # For auth events (login/logout/failed)
-    username = models.CharField(max_length=150, blank=True, default="")
-    ip_address = models.GenericIPAddressField(null=True, blank=True)
-    user_agent = models.TextField(blank=True, default="")
-
     created_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
         indexes = [
             models.Index(fields=["event", "created_at"]),
             models.Index(fields=["patient", "created_at"]),
-            models.Index(fields=["username", "created_at"]),
         ]
-        ordering = ("-created_at",)
 
     def __str__(self) -> str:
-        who = self.username or (self.changed_by.get_username() if self.changed_by else "unknown")
-        return f"[{self.created_at:%Y-%m-%d %H:%M}] {self.get_event_display()} — {who}"
-
+        return f"[{self.created_at:%Y-%m-%d %H:%M}] {self.get_event_display()} — {self.patient}"
