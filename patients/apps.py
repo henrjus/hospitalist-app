@@ -1,4 +1,3 @@
-# patients/apps.py
 from django.apps import AppConfig
 
 class PatientsConfig(AppConfig):
@@ -6,5 +5,5 @@ class PatientsConfig(AppConfig):
     name = "patients"
 
     def ready(self):
-        # Import signal handlers so Django connects them
-        from . import audit  # noqa: F401
+        # Import signal handlers
+        from . import signals  # noqa: F401
