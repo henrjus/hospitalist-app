@@ -1,0 +1,61 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}Hospitalist App{% endblock %}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="{% static 'patients/base.css' %}">
+  <script defer src="{% static 'patients/notifications.js' %}"></script>
+  {% block extra_head %}{% endblock %}
+</head>
+<body>
+  <div class="wrap">
+    <!-- Global header with unread badge -->
+    <div class="topbar">
+      <div class="brand">Hospitalist App</div>
+      <div class="nav">
+        <a href="/notifications/">Notifications</a>
+        <span
+          id="notifications-badge"
+          class="badge {% if notifications_unread_count == 0 %}hidden{% endif %}"
+          data-count="{{ notifications_unread_count|default:0 }}"
+        >
+          {{ notifications_unread_count|default:0 }}
+        </span>
+        <a href="/admin/">Admin</a>
+      </div>
+    </div>
+
+    <!-- Django messages (optional, handy) -->
+    {% if messages %}
+      <div class="messages">
+        {% for m in messages %}
+          <div class="note">{{ m }}</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+
+    {% block content %}{% endblock %}
+  </div>
+
+  <!-- Toast notification box (controlled by JS) -->
+  <div id="toast"></div>
+
+  <!-- Modal (blocking) for CRITICAL notifications -->
+  <div id="modal-backdrop" style="display:none;"></div>
+  <div id="critical-modal" aria-hidden="true" role="dialog" aria-modal="true" style="display:none;">
+    <div class="modal-content">
+      <div class="modal-header">
+        <span class="modal-title">Critical alert</span>
+      </div>
+      <div class="modal-body" id="critical-modal-body">
+        <!-- message injected by JS -->
+      </div>
+      <div class="modal-actions">
+        <button id="critical-ack-btn" type="button">Acknowledge</button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

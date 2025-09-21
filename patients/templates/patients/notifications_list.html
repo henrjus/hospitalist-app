@@ -1,0 +1,63 @@
+{% extends "patients/base.html" %}
+
+{% block title %}Notifications · Hospitalist App{% endblock %}
+
+{% block content %}
+  <h1>Your Notifications</h1>
+
+  <!-- Toggle: Unread / All -->
+  <div class="meta" style="margin: 0 0 12px; gap: 12px;">
+    <span>Show:</span>
+    {% if current_filter == "unread" %}
+      <strong>Unread</strong> · <a href="?show=all">All</a>
+    {% else %}
+      <a href="?show=unread">Unread</a> · <strong>All</strong>
+    {% endif %}
+  </div>
+
+  <!-- Mark all as read (only show when useful) -->
+  {% if notifications_unread_count|add:0 > 0 %}
+    {% if current_filter != "unread" or notifications %}
+      <form method="post" action="{% url 'patients:notifications_mark_all_read' %}" style="margin: 0 0 12px;">
+        {% csrf_token %}
+        <button type="submit">
+          Mark all as read (<span id="unread-count">{{ notifications_unread_count }}</span>)
+        </button>
+      </form>
+    {% endif %}
+  {% endif %}
+
+  <!-- Live-updating section: server returns only this inner HTML when ?partial=1 -->
+  <div id="notifications-container">
+    {% include "patients/partials/notifications_list_inner.html" %}
+  </div>
+{% endblock %}
+
+{% block extra_head %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  const container = document.getElementById("notifications-container");
+  if (!container) return;
+
+  async function refreshList() {
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set("partial", "1");
+      const res = await fetch(url.toString(), { credentials: "same-origin" });
+      if (res.ok) {
+        container.innerHTML = await res.text();
+      }
+    } catch (err) {
+      console.warn("Failed to refresh notifications list", err);
+    }
+  }
+
+  // quick first refresh, then every 30s, and on tab focus
+  setTimeout(refreshList, 1500);
+  setInterval(refreshList, 30000);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refreshList();
+  });
+});
+</script>
+{% endblock %}

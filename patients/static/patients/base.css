@@ -1,0 +1,161 @@
+:root { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+body { margin: 24px; }
+.wrap { max-width: 900px; margin: 0 auto; }
+.topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.brand { font-weight: 600; }
+.nav { display: flex; align-items: center; gap: 12px; }
+.badge {
+  display: inline-block; min-width: 20px; padding: 2px 6px; text-align: center;
+  border-radius: 10px; border: 1px solid #ccc; background: #f7f7f7; font-size: 12px;
+}
+.badge.hidden { display: none; }
+
+/* Page content helpers */
+h1 { margin: 0 0 16px; }
+.note { border: 1px solid #ddd; border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+.note.unread { border-color: #888; background: #fffdf5; }
+.meta { font-size: 12px; color: #666; margin-bottom: 6px; display: flex; gap: 8px; flex-wrap: wrap; }
+.msg { white-space: pre-wrap; }
+.actions { margin-top: 8px; display: flex; gap: 8px; }
+form { display: inline; }
+button { padding: 6px 10px; border-radius: 8px; border: 1px solid #ccc; background: #f7f7f7; cursor: pointer; }
+button:hover { background: #f0f0f0; }
+.empty { color: #777; }
+
+/* Toast notification (appearance only; behavior via JS) */
+#toast {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  background: #333;          /* base fallback; overridden by level classes below */
+  color: #fff;
+  padding: 10px 12px;
+  border-radius: 6px;
+  z-index: 1000;
+  max-width: 400px;
+  font-size: 14px;
+  line-height: 1.4;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.2);
+
+  /* show/hide via opacity/visibility (no display toggles) */
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(-6px);
+  transition:
+    opacity .25s ease,
+    transform .25s ease,
+    visibility 0s linear .25s;
+
+  /* NEW: simple row layout so the × doesn’t overlap text */
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* visible state */
+#toast.show {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translateY(0);
+  transition:
+    opacity .25s ease,
+    transform .25s ease,
+    visibility 0s;
+}
+
+#toast .icon { flex: 0 0 auto; }
+
+/* message grows and wraps nicely */
+#toast .toast__msg {
+  flex: 1 1 auto;
+  min-width: 0;              /* avoid overflow on long lines */
+  white-space: normal;
+}
+
+/* close button sits at the right without overlapping */
+#toast .toast__close {
+  position: static;
+  margin-left: 8px;
+  font-size: 26px;          /* larger glyph */
+  line-height: 1;
+  width: 28px;              /* bigger tap target */
+  height: 28px;
+  display: inline-flex;     /* center the × */
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  border-radius: 6px;
+  opacity: 0.9;
+}
+#toast .toast__close:hover,
+#toast .toast__close:focus {
+  opacity: 1;
+  outline: none;
+  transform: scale(1.1);   /* gentle feedback */
+}
+
+/* Level colors — match Notification.level values */
+#toast.info     { background: #007bff; }               /* blue */
+#toast.warning  { background: #ffc107; color: #000; }  /* amber/black */
+#toast.critical { background: #dc3545; }               /* red */
+
+/* === Critical Modal Styles === */
+#modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 1000; /* sits below modal but above page */
+}
+
+#critical-modal {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+  width: 400px;
+  max-width: 90%;
+  z-index: 1100;
+  font-family: system-ui, sans-serif;
+}
+
+#critical-modal[aria-hidden="true"] {
+  display: none;
+}
+
+#critical-modal .modal-content {
+  padding: 16px;
+}
+
+#critical-modal .modal-header {
+  font-weight: bold;
+  margin-bottom: 8px;
+  color: #b00020; /* red for critical */
+}
+
+#critical-modal .modal-body {
+  margin-bottom: 12px;
+}
+
+#critical-modal .modal-actions {
+  text-align: right;
+}
+
+#critical-ack-btn {
+  background: #b00020;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+#critical-ack-btn:hover {
+  background: #a0001c;
+}
