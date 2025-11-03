@@ -1,7 +1,7 @@
 # patients/views.py
 from django.contrib.auth.decorators import login_required
 from django.views.decorators.http import require_POST
-from django.shortcuts import get_object_or_404, redirect
+from django.shortcuts import render, get_object_or_404, redirect
 from django.http import HttpResponse, JsonResponse
 from django.utils import timezone
 from django.template import loader, TemplateDoesNotExist
@@ -12,13 +12,16 @@ from django.utils.timezone import localtime
 from .models import Notification
 
 
+def _is_partial_request(request):
+    return request.headers.get("x-requested-with") == "XMLHttpRequest" or request.GET.get("partial") == "1"
+
+
 @login_required
-def notifications_list(request):
+def notifications(request):
     """
-    Show the current user's notifications that are visible now (visible_at <= now).
-    Supports ?show=unread (otherwise 'all'). Paginates 25 per page.
-    Orders: unread first, then newest.
-    Also supports ?partial=1 to return only the inner list HTML (for AJAX refresh).
+    Notifications page and AJAX partial endpoint.
+    - Full page: renders patients/notifications_list.html
+    - Partial (AJAX or ?partial=1): renders notifications/_list_wrapper.html (button + list)
     """
     now = timezone.now()
 
@@ -37,7 +40,6 @@ def notifications_list(request):
                 output_field=BooleanField(),
             )
         )
-        # If your template shows patient info, this helps avoid extra queries:
         .select_related("patient")
     )
 
@@ -46,7 +48,7 @@ def notifications_list(request):
 
     qs = qs.order_by("-is_unread", "-visible_at", "-created_at")
 
-    # ---- Pagination ----
+    # Pagination
     page = request.GET.get("page", 1)
     paginator = Paginator(qs, 25)
     try:
@@ -56,26 +58,25 @@ def notifications_list(request):
     except EmptyPage:
         page_obj = paginator.page(paginator.num_pages)
 
-    # ---- Context (define BEFORE any rendering) ----
+    notifications_list = list(page_obj.object_list)
+    unread_count = sum(1 for n in notifications_list if n.read_at is None)
+    # Also include count of visible & unread across whole query if you prefer:
+    # unread_count = qs.filter(read_at__isnull=True).count()
+
     context = {
-        "notifications": list(page_obj.object_list),
+        "notifications": notifications_list,
         "page_obj": page_obj,
         "paginator": paginator,
-        "current_filter": show,  # used by the template to highlight the toggle
+        "current_filter": show,
+        "unread_count": unread_count,
     }
 
-    # --- Partial render for AJAX refresh ---
-    if request.GET.get("partial") == "1":
-        try:
-            tmpl = loader.get_template("patients/partials/notifications_list_inner.html")
-            return HttpResponse(tmpl.render(context, request))
-        except TemplateDoesNotExist:
-            pass  # fall through to full-page render
+    if _is_partial_request(request):
+        return render(request, "notifications/_list_wrapper.html", context)
 
-    # ---- Full-page render (existing behavior) ----
+    # Full page render: try project template, fallback to text/plain list
     try:
-        tmpl = loader.get_template("patients/notifications_list.html")
-        return HttpResponse(tmpl.render(context, request))
+        return render(request, "patients/notifications_list.html", context)
     except TemplateDoesNotExist:
         lines = []
         for n in context["notifications"]:
@@ -91,7 +92,7 @@ def notification_mark_read(request, pk: int):
     n = get_object_or_404(Notification, pk=pk, recipient=request.user)
     if n.read_at is None:
         n.mark_read()
-    return redirect("patients:notifications_list")
+    return redirect("patients:notifications")
 
 
 @login_required
@@ -100,17 +101,12 @@ def notification_mark_unread(request, pk: int):
     n = get_object_or_404(Notification, pk=pk, recipient=request.user)
     if n.read_at is not None:
         n.mark_unread()
-    return redirect("patients:notifications_list")
+    return redirect("patients:notifications")
 
 
 @login_required
 @require_POST
 def notification_ack(request, pk: int):
-    """
-    Acknowledge (dismiss/confirm) a notification.
-    Only the recipient can acknowledge it.
-    Idempotent: safe to call multiple times.
-    """
     n = get_object_or_404(Notification, pk=pk, recipient=request.user)
 
     if n.acknowledged_at is None:
@@ -129,40 +125,33 @@ def notification_ack(request, pk: int):
 @require_POST
 def notifications_mark_all_read(request):
     """
-    Mark all of the current user's *visible* notifications as read.
-    (visible_at <= now, read_at IS NULL)
+    Mark all visible & unread notifications for the current user as read.
+    Return the wrapper partial for AJAX, otherwise redirect to the notifications page.
     """
     now = timezone.now()
-    (Notification.objects
-        .filter(recipient=request.user, visible_at__lte=now, read_at__isnull=True)
-        .update(read_at=now))
-    return redirect("patients:notifications_list")
+    Notification.objects.filter(recipient=request.user, visible_at__lte=now, read_at__isnull=True).update(read_at=now)
+
+    if _is_partial_request(request):
+        # Rebuild fresh queryset for render
+        qs = Notification.objects.filter(recipient=request.user, visible_at__isnull=False, visible_at__lte=now).order_by("-visible_at", "-created_at")
+        context = {
+            "notifications": list(qs[:25]),
+            "page_obj": None,
+            "paginator": None,
+            "current_filter": "all",
+            "unread_count": 0,
+        }
+        return render(request, "notifications/_list_wrapper.html", context)
+
+    return redirect("patients:notifications")
 
 
-# === API: lightweight status for polling (legacy badge) ===
 @login_required
 def notification_status(request):
-    """
-    Returns a tiny JSON payload for polling the badge/toast:
-      - unread_count: unread + already-visible items (legacy semantics)
-      - latest_ts: most recent visibility time (to detect new since last check)
-      - latest_message: the message of that latest notification (for toast)
-      - server_now: server time (helps client-side drift)
-    """
     now = timezone.now()
-
-    # Only consider notifications that are visible now
     visible_qs = Notification.objects.filter(recipient=request.user, visible_at__lte=now)
-
-    # Unread = visible and read_at is null (legacy meaning)
     unread_count = visible_qs.filter(read_at__isnull=True).count()
-
-    # Prefer latest by visible_at (fallback to created_at)
-    latest_obj = (
-        visible_qs.order_by("-visible_at", "-created_at")
-        .values("visible_at", "message")
-        .first()
-    )
+    latest_obj = visible_qs.order_by("-visible_at", "-created_at").values("visible_at", "message").first()
 
     return JsonResponse({
         "unread_count": unread_count,
@@ -172,61 +161,24 @@ def notification_status(request):
     })
 
 
-# === API (NEW): unified global JSON feed for toasts/modals ===
 @login_required
 def notifications_feed(request):
-    """
-    JSON feed of the current user's *visible & unacknowledged* notifications.
-    Optional ?since_id=<int> returns only notifications with id > since_id.
-
-    Returns:
-      {
-        "items": [
-          {"id","level","category","message","created_at","visible_at"}
-        ],
-        "unread_count": <int>,   # count of visible & UNACKNOWLEDGED items (new semantics)
-        "latest_id": <int|null>  # newest notification id for THIS USER
-      }
-    """
     now = timezone.now()
     since_id = request.GET.get("since_id")
 
-    qs = (
-        Notification.objects
-        .filter(recipient=request.user, visible_at__lte=now, acknowledged_at__isnull=True)
-        .order_by("-id")
-    )
-
+    qs = Notification.objects.filter(recipient=request.user, visible_at__lte=now, acknowledged_at__isnull=True).order_by("-id")
     if since_id and str(since_id).isdigit():
         qs = qs.filter(id__gt=int(since_id))
 
-    # Cap payload and return oldest→newest for natural reading
     items = list(qs[:20].values("id", "level", "category", "message", "created_at", "visible_at"))
     items.reverse()
-
-    # Make datetimes ISO strings
     for it in items:
         ca = it.get("created_at")
         va = it.get("visible_at")
         it["created_at"] = localtime(ca).isoformat() if ca else None
         it["visible_at"] = localtime(va).isoformat() if va else None
 
-    # Count of visible & unacknowledged (badge semantics for unified client)
-    unack_count = (
-        Notification.objects
-        .filter(recipient=request.user, visible_at__lte=now, acknowledged_at__isnull=True)
-        .count()
-    )
+    unack_count = Notification.objects.filter(recipient=request.user, visible_at__lte=now, acknowledged_at__isnull=True).count()
+    latest_id = Notification.objects.filter(recipient=request.user).aggregate(max_id=Max("id")).get("max_id")
 
-    # Latest id for THIS USER (not global)
-    latest_id = (
-        Notification.objects
-        .filter(recipient=request.user)
-        .aggregate(max_id=Max("id"))
-        .get("max_id")
-    )
-
-    return JsonResponse(
-        {"items": items, "unread_count": unack_count, "latest_id": latest_id},
-        status=200,
-    )
+    return JsonResponse({"items": items, "unread_count": unack_count, "latest_id": latest_id}, status=200)

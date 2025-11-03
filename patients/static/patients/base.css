@@ -46,11 +46,6 @@ button:hover { background: #f0f0f0; }
     opacity .25s ease,
     transform .25s ease,
     visibility 0s linear .25s;
-
-  /* NEW: simple row layout so the × doesn’t overlap text */
-  display: flex;
-  align-items: center;
-  gap: 8px;
 }
 
 /* visible state */
@@ -63,40 +58,6 @@ button:hover { background: #f0f0f0; }
     opacity .25s ease,
     transform .25s ease,
     visibility 0s;
-}
-
-#toast .icon { flex: 0 0 auto; }
-
-/* message grows and wraps nicely */
-#toast .toast__msg {
-  flex: 1 1 auto;
-  min-width: 0;              /* avoid overflow on long lines */
-  white-space: normal;
-}
-
-/* close button sits at the right without overlapping */
-#toast .toast__close {
-  position: static;
-  margin-left: 8px;
-  font-size: 26px;          /* larger glyph */
-  line-height: 1;
-  width: 28px;              /* bigger tap target */
-  height: 28px;
-  display: inline-flex;     /* center the × */
-  align-items: center;
-  justify-content: center;
-  border: 0;
-  background: transparent;
-  color: inherit;
-  cursor: pointer;
-  border-radius: 6px;
-  opacity: 0.9;
-}
-#toast .toast__close:hover,
-#toast .toast__close:focus {
-  opacity: 1;
-  outline: none;
-  transform: scale(1.1);   /* gentle feedback */
 }
 
 /* Level colors — match Notification.level values */
@@ -159,3 +120,73 @@ button:hover { background: #f0f0f0; }
 #critical-ack-btn:hover {
   background: #a0001c;
 }
+
+/* === Toast (new structure) ============================================= */
+
+/* Container stays fixed+inert until .show is applied (you already have this) */
+/* We keep your existing #toast rules; we now style its inner wrapper: */
+#toast .toast-main {
+  display: grid;
+  grid-template-columns: auto 1fr auto; /* icon | body | × */
+  align-items: center;
+  gap: 10px;
+  background: inherit;  /* inherit level background from #toast */
+  color: inherit;       /* inherit text color from #toast */
+  padding: 10px 12px;
+  border-radius: 6px;
+}
+
+/* Icon sizing */
+#toast .icon {
+  font-size: 18px;
+  line-height: 1;
+}
+
+/* New clickable body area */
+#toast .toast-body {
+  cursor: pointer;      /* affordance that it navigates */
+  min-width: 0;         /* allow wrapping */
+  outline: none;        /* we’ll draw a custom focus below */
+}
+
+/* Hover/active cues */
+#toast .toast-body:hover {
+  text-decoration: underline;
+}
+#toast .toast-body:active {
+  opacity: 0.9;
+}
+
+/* Keyboard focus ring for accessibility */
+#toast .toast-body:focus-visible {
+  box-shadow: 0 0 0 3px #fff, 0 0 0 5px #3b82f6; /* white ring + blue halo */
+  border-radius: 4px;
+}
+
+/* Close button (new class) */
+#toast .toast-close {
+  appearance: none;
+  border: none;
+  background: transparent;
+  font-size: 22px;
+  line-height: 1;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;     /* center the × */
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: inherit;
+  border-radius: 6px;
+  opacity: 0.9;
+}
+#toast .toast-close:hover,
+#toast .toast-close:focus {
+  opacity: 1;
+  transform: scale(1.06);
+}
+
+/* Level colors on the container still apply (you already have these): 
+   #toast.info / #toast.warning / #toast.critical 
+   We keep them as-is.
+*/
