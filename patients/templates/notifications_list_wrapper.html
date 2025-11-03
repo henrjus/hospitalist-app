@@ -1,0 +1,25 @@
+<div id="notifications-wrapper" class="notifications-wrapper">
+  <div class="notifications-header">
+    <h2>Notifications <span id="header-unread-count" class="badge">{{ unread_count }}</span></h2>
+
+    <form id="mark-all-form" action="{% url 'notifications_mark_all_read' %}" method="post">
+      {% csrf_token %}
+      <button id="mark-all-btn" type="submit" class="btn btn-sm btn-primary">
+        Mark all as read ({{ unread_count }})
+      </button>
+    </form>
+  </div>
+
+  <div id="notifications-list" class="notifications-list">
+    {% for n in notifications %}
+      <div class="notification {% if n.read_at is None %}unread{% endif %}" data-id="{{ n.pk }}">
+        <div class="notif-meta">
+          <span class="notif-visible">{{ n.visible_at }}</span>
+        </div>
+        <div class="notif-body">{{ n.message|linebreaks }}</div>
+      </div>
+    {% empty %}
+      <div class="no-notifications">No notifications.</div>
+    {% endfor %}
+  </div>
+</div>

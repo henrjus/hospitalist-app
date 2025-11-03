@@ -5,7 +5,7 @@ from . import views
 app_name = "patients"
 
 urlpatterns = [
-    path("notifications/", views.notifications_list, name="notifications_list"),
+    path("notifications/", views.notifications, name="notifications"),
     path("notifications/<int:pk>/read/", views.notification_mark_read, name="notification_mark_read"),
     path("notifications/<int:pk>/unread/", views.notification_mark_unread, name="notification_mark_unread"),
     path("notifications/<int:pk>/ack/", views.notification_ack, name="notification_ack"),

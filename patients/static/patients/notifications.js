@@ -131,32 +131,80 @@
     }
   }
 
-  // Persistent toast with visible × (click toast or × = dismiss + ack)
+  // Persistent toast with two distinct actions (final semantics):
+  // - Click body => ACK (only) then navigate to /notifications/?show=unread  (still UNREAD)
+  // - Click ×    => ACK only (dismiss), no navigation, still UNREAD
   function showToast(msg, level = "info", id = null) {
     const { toast } = ensureContainers();
     const icons = { info: "ℹ️", warning: "⚠️", critical: "⛔" };
     const icon = icons[level] || icons.info;
 
-    toast.innerHTML =
-      `<span class="icon">${icon}</span>` +
-      `<span class="toast__msg">${escapeHtml(msg)}</span>` +
-      `<button type="button" class="toast__close" aria-label="Dismiss notification" title="Dismiss">×</button>`;
-      
+    // clear any legacy whole-toast handler from previous loads
+    toast.onclick = null;
+
+    // Build clear targets: .toast-body (navigate) and .toast-close (ack-only)
+    toast.innerHTML = `
+      <div class="toast-main level-${level}">
+        <span class="icon" aria-hidden="true">${icon}</span>
+        <div class="toast-body" role="button" tabindex="0" aria-label="View unread notifications">
+          <div class="toast-message">${escapeHtml(msg)}</div>
+        </div>
+        <button type="button" class="toast-close" aria-label="Dismiss notification" title="Dismiss">×</button>
+      </div>
+    `;
+
+    // reset/show with level classes
     toast.className = "toast";
     toast.classList.add(level, "show");
 
-    const closeBtn = toast.querySelector(".toast__close");
+    const bodyEl  = toast.querySelector(".toast-body");
+    const closeBtn = toast.querySelector(".toast-close");
 
-    const onDismiss = async () => {
-      toast.classList.remove("show");
-      if (id) await ack(id);
-      toast.onclick = null;
-      if (closeBtn) closeBtn.removeEventListener("click", onDismiss);
+    // Body click => ACK (only) then navigate to Unread (do not mark read)
+    const goUnread = () => {
+      if (id) {
+        try {
+          fetch(ackUrl(id), {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "X-CSRFToken": getCookie("csrftoken") },
+            keepalive: true, // ensure the POST isn't dropped during navigation
+          });
+        } catch (_e) {
+          // ignore
+        }
+      }
+      window.location.assign("/notifications/?show=unread");
     };
 
-    // Both the × and clicking the toast dismiss
-    if (closeBtn) closeBtn.addEventListener("click", onDismiss);
-    toast.onclick = onDismiss;
+    if (bodyEl) {
+      bodyEl.addEventListener("click", (e) => {
+        e.stopPropagation();
+        goUnread();
+      });
+      bodyEl.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          e.stopPropagation();
+          goUnread();
+        }
+      });
+    }
+
+    // × click => ack only (dismiss), NO navigation
+    const onDismiss = async (e) => {
+      e.stopPropagation(); // ensure no fall-through
+      toast.classList.remove("show");
+      if (id) await ack(id);
+      if (closeBtn) closeBtn.removeEventListener("click", onDismiss);
+      // no navigation here
+    };
+    if (closeBtn) {
+      closeBtn.addEventListener("click", onDismiss);
+    }
+
+    // IMPORTANT: remove old behavior where clicking the whole toast dismissed
+    // We deliberately DO NOT set toast.onclick here.
   }
 
   // Blocking critical modal (ESC or button = ack)
@@ -184,9 +232,40 @@
     document.addEventListener("keydown", onKey);
   }
 
+  // --- Notifications page auto-refresh (partial) ----------------------------
+  function onNotificationsPage() {
+    return window.location.pathname.startsWith("/notifications");
+  }
+
+  function refreshNotificationsList(force = false) {
+    if (!onNotificationsPage()) return;
+    // Skip refresh for background tabs unless forced
+    if (document.hidden && !force) return;
+
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set("partial", "1"); // server returns the inner list markup
+      fetch(url.toString(), { credentials: "same-origin" })
+        .then((res) => (res.ok ? res.text() : null))
+        .then((html) => {
+          if (!html) return;
+          // Try likely containers; replace whichever is present
+          const host =
+            document.getElementById("notifications-list") ||
+            document.getElementById("notifications-list-inner") ||
+            document.querySelector("[data-notifications-list]");
+          if (host) host.innerHTML = html;
+        })
+        .catch(() => { /* ignore transient errors */ });
+    } catch (_e) {
+      // ignore
+    }
+  }
+
   // Polling with cursor + dedupe
   const seenIds = new Set();
   let cursor = parseInt(localStorage.getItem("notif:lastSeenId") || "0", 10) || 0;
+  let lastUnreadCount = null; // NEW: track unread count we last saw
 
   async function poll() {
     try {
@@ -199,6 +278,7 @@
 
         // Handle items from the feed (toasts/modals)
         const items = data.items || [];
+        const hadNewItems = items.length > 0; // NEW
         for (const it of items) {
         if (!it || typeof it.id === "undefined") continue;
         if (seenIds.has(it.id)) continue;
@@ -222,14 +302,26 @@
 
         // Refresh the HEADER BADGE from the status endpoint (UNREAD semantics)
         try {
-        const sr = await fetch(STATUS_URL, { credentials: "same-origin" });
-        if (sr.ok) {
+          const sr = await fetch(STATUS_URL, { credentials: "same-origin" });
+          if (sr.ok) {
             const sj = await sr.json();
-            updateBadge(sj.unread_count || 0);
-        }
+            const newCount = Number(sj.unread_count || 0);
+            updateBadge(newCount);
+
+            // If unread count changed, or if new items arrived, refresh the list on the notifications page
+            if (lastUnreadCount === null) lastUnreadCount = newCount;
+            if (newCount !== lastUnreadCount) {
+              lastUnreadCount = newCount;
+              refreshNotificationsList(true); // reflect count change immediately
+            } else if (hadNewItems) {
+              // Count didn't change (e.g., ack-only), but new items arrived: refresh the list too
+              refreshNotificationsList(true);
+            }
+          }
         } catch (_e) {
-        // ignore transient errors
+          // ignore transient errors
         }
+
     } catch (_e) {
         // ignore transient errors
     }
